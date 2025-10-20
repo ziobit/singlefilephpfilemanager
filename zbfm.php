@@ -89,6 +89,21 @@ function is_image_ext(string $name): bool {
   $ext=strtolower(pathinfo($name,PATHINFO_EXTENSION));
   return in_array($ext,['jpg','jpeg','png','gif','webp','bmp','svg']);
 }
+function is_text_ext(string $name): bool {
+  $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+  if ($ext === '') {
+    // files like .htaccess
+    $base = basename($name);
+    return in_array($base, ['.htaccess', '.env', 'Dockerfile', 'Makefile']);
+  }
+  return in_array($ext, [
+    'txt','log','md','markdown','csv','tsv','json','yaml','yml','xml','svg','ini','conf','config','env',
+    'htm','html','css','js','mjs','ts','tsx','jsx',
+    'php','phtml','inc','php3','php4','php5','phps',
+    'c','h','cpp','hpp','cc','hh','cs','java','kt','go','rs','swift','m','mm',
+    'py','rb','pl','sh','bash','zsh','ps1','sql','twig','vue','svelte','jade','ejs','handlebars','hbs'
+  ]);
+}
 
 // --- GD helpers for image batch ---
 function gd_load(string $path, string $ext, ?string &$err) {
@@ -215,6 +230,33 @@ if (isset($_GET['preview']) && isset($_GET['f'])) {
   http_response_code(404); exit;
 }
 
+// READ file for editor (AJAX JSON)
+if (isset($_GET['read']) && isset($_GET['f']) && is_authenticated()) {
+  $rel = (string)$_GET['f']; $abs = secure_path($rel);
+  header('Content-Type: application/json; charset=UTF-8');
+  if ($abs && is_file($abs) && is_text_ext($abs)) {
+    $size = @filesize($abs);
+    if ($size === false) { echo json_encode(['ok'=>false,'error'=>'Cannot stat file']); exit; }
+    $limit = 2 * 1024 * 1024; // 2 MB limit for inline editor
+    if ($size > $limit) { echo json_encode(['ok'=>false,'error'=>'File too large for inline editor (2MB limit).']); exit; }
+    $content = @file_get_contents($abs);
+    if ($content === false) { echo json_encode(['ok'=>false,'error'=>'Cannot read file']); exit; }
+    $ext = strtolower(pathinfo($abs, PATHINFO_EXTENSION));
+    echo json_encode([
+      'ok'=>true,
+      'name'=>basename($abs),
+      'rel'=>to_rel($abs),
+      'size'=>$size,
+      'mtime'=>@filemtime($abs) ?: 0,
+      'writable'=>is_writable($abs),
+      'ext'=>$ext,
+      'content'=>$content,
+    ]);
+    exit;
+  }
+  echo json_encode(['ok'=>false,'error'=>'Invalid file']); exit;
+}
+
 // File download (keep simple; no token needed)
 if (isset($_GET['download']) && isset($_GET['f']) && is_authenticated()) {
   $rel = (string)$_GET['f']; $abs = secure_path($rel);
@@ -272,7 +314,7 @@ if (!is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST
 $rel = isset($_GET['p']) ? (string)$_GET['p'] : '';
 $abs = secure_path($rel); if ($abs===false || !is_dir($abs)) { $rel=''; $abs=BASE_ROOT; }
 
-// Operations (rename/zip/unzip/delete/emptytrash/newfile/newfolder/upload/imgbatch)
+// Operations (rename/zip/unzip/delete/emptytrash/newfile/newfolder/upload/imgbatch/savefile)
 if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['op'])) {
   $op = (string)$_POST['op'];
 
@@ -459,6 +501,29 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     header('Location: ' . basename(__FILE__) . ($rel!==''?'?p='.rawurlencode($rel):'')); exit;
   }
 
+  // ---- Save edited text file
+  if ($op === 'savefile') {
+    $itemRel = (string)($_POST['item'] ?? '');
+    $content = (string)($_POST['content'] ?? '');
+    $itemAbs = secure_path($itemRel);
+    if ($itemAbs === false || !is_file($itemAbs) || !is_text_ext($itemAbs)) {
+      flash_set('Invalid file for save.');
+      header('Location: ' . basename(__FILE__) . ($rel!==''?'?p='.rawurlencode($rel):'')); exit;
+    }
+    if (!is_writable($itemAbs)) {
+      flash_set('File is not writable.');
+      header('Location: ' . basename(__FILE__) . ($rel!==''?'?p='.rawurlencode($rel):'')); exit;
+    }
+    $ok = @file_put_contents($itemAbs, $content);
+    if ($ok === false) {
+      flash_set('Save failed.');
+    } else {
+      @touch($itemAbs, time());
+      flash_set('File saved: '.basename($itemAbs));
+    }
+    header('Location: ' . basename(__FILE__) . ($rel!==''?'?p='.rawurlencode($rel):'')); exit;
+  }
+
   // ---- Create file/folder
   if ($op === 'newfile' || $op === 'newfolder') {
     $baseRel = (string)($_POST['base'] ?? '');
@@ -514,7 +579,9 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
       $err=null; $ok=delete_item($itemAbs,$err);
       flash_set($ok ? (is_in_trash($itemAbs)?'Permanently deleted.':'Moved to trash.') : ('Delete error: '.($err??'unknown')));
     } else {
-      flash_set('Unknown operation.');
+      if ($op !== 'savefile' && $op !== 'imgbatch' && $op !== 'newfile' && $op !== 'newfolder' && $op !== 'upload' && $op !== 'emptytrash') {
+        flash_set('Unknown operation.');
+      }
     }
   }
   header('Location: ' . basename(__FILE__) . ($rel!==''?'?p='.rawurlencode($rel):'')); exit;
@@ -557,6 +624,8 @@ foreach ($entries as $en) {
     .icon-row { display:flex; align-items:center; gap:.15rem; }
     .usage-wrap { width: 100%; height: .6rem; background: rgba(0,0,0,.075); border-radius: .25rem; overflow: hidden; }
     .usage-bar { height: 100%; background: #0d6efd; }
+    .editor-wrap { height: 70vh; border: 1px solid rgba(0,0,0,.125); border-radius: .25rem; }
+    #aceEditor { width: 100%; height: 100%; }
   </style>
 </head>
 <body class="bg-light">
@@ -599,6 +668,36 @@ foreach ($entries as $en) {
         <div class="modal-footer">
           <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
           <button type="submit" class="btn btn-primary" id="uploadStartBtn"><i class="bi bi-cloud-arrow-up"></i> Start upload</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Editor Modal -->
+  <div class="modal fade" id="editModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+      <form class="modal-content" id="editForm" method="post">
+        <input type="hidden" name="op" value="savefile">
+        <input type="hidden" name="item" id="editItem" value="">
+        <textarea name="content" id="editContent" style="display:none;"></textarea>
+        <div class="modal-header">
+          <h5 class="modal-title"><i class="bi bi-code-slash"></i> Edit: <span id="editTitle" class="mono"></span></h5>
+          <div class="ms-auto d-flex align-items-center gap-2">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="toggleWrap">
+              <label class="form-check-label" for="toggleWrap">Wrap</label>
+            </div>
+            <button type="button" class="btn btn-light btn-sm" id="btnEditorReload" title="Reload from disk"><i class="bi bi-arrow-clockwise"></i></button>
+            <button type="submit" class="btn btn-primary btn-sm" id="btnEditorSave"><i class="bi bi-save"></i> Save (Ctrl+S)</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <div class="editor-wrap"><div id="aceEditor"></div></div>
+          <div class="small text-muted mt-2">
+            Tip: Use Ctrl/Cmd+S to save. Some very large files are not supported by the inline editor.
+          </div>
+          <div class="alert alert-danger mt-2 py-2 px-3 d-none" id="editError"></div>
         </div>
       </form>
     </div>
@@ -693,8 +792,8 @@ foreach ($entries as $en) {
             <table class="table table-sm table-hover mb-0">
               <thead class="table-light">
                 <tr>
-                  <th style="width:16%">Actions</th>
-                  <th style="width:44%"><a href="?<?= 'sort=name&dir='.(($sort==='name'&&$dir==='asc')?'desc':'asc').($rel!==''?'&p='.rawurlencode($rel):'') ?>" class="text-decoration-none" data-folder-link>Name <?= $sort==='name' ? ($dir==='asc'?'▲':'▼') : '' ?></a></th>
+                  <th style="width:18%">Actions</th>
+                  <th style="width:42%"><a href="?<?= 'sort=name&dir='.(($sort==='name'&&$dir==='asc')?'desc':'asc').($rel!==''?'&p='.rawurlencode($rel):'') ?>" class="text-decoration-none" data-folder-link>Name <?= $sort==='name' ? ($dir==='asc'?'▲':'▼') : '' ?></a></th>
                   <th style="width:20%"><a href="?<?= 'sort=date&dir='.(($sort==='date'&&$dir==='asc')?'desc':'asc').($rel!==''?'&p='.rawurlencode($rel):'') ?>" class="text-decoration-none" data-folder-link>Modified <?= $sort==='date' ? ($dir==='asc'?'▲':'▼') : '' ?></a></th>
                   <th style="width:15%"><a href="?<?= 'sort=size&dir='.(($sort==='size'&&$dir==='asc')?'desc':'asc').($rel!==''?'&p='.rawurlencode($rel):'') ?>" class="text-decoration-none" data-folder-link>Size <?= $sort==='size' ? ($dir==='asc'?'▲':'▼') : '' ?></a></th>
                   <th style="width:5%">Usage</th>
@@ -711,6 +810,7 @@ foreach ($entries as $en) {
                   $size_h = size_human($size);
                   $nextRel= $e['rel'];
                   $isImg  = (!$isDir && is_image_ext($name));
+                  $isText = (!$isDir && is_text_ext($name));
                   $previewUrl = '?preview=1&f='.rawurlencode($nextRel);
                   $isZip  = (!$isDir && strtolower(pathinfo($name, PATHINFO_EXTENSION))==='zip');
                   $pct    = ($total_bytes>0) ? max(0, min(100, round($size*100/$total_bytes))) : 0;
@@ -726,6 +826,12 @@ foreach ($entries as $en) {
                           <a class="icon-btn" title="Download (zip)" href="#" data-download-folder data-rel="<?=htmlspecialchars($nextRel)?>" data-name="<?=htmlspecialchars($name)?>">
                             <i class="bi bi-download"></i>
                           </a>
+                        <?php endif; ?>
+
+                        <?php if ($isText): ?>
+                          <button type="button" class="icon-btn" title="Edit" data-edit data-rel="<?=htmlspecialchars($nextRel)?>" data-name="<?=htmlspecialchars($name)?>">
+                            <i class="bi bi-code-slash"></i>
+                          </button>
                         <?php endif; ?>
 
                         <form method="post" class="d-inline" data-opform="rename">
@@ -792,6 +898,7 @@ foreach ($entries as $en) {
         <div class="card-footer">
           <div class="small text-muted d-flex flex-wrap gap-3">
             <span><i class="bi bi-download"></i> download</span>
+            <span><i class="bi bi-code-slash"></i> edit</span>
             <span><i class="bi bi-pencil-square"></i> rename</span>
             <span><i class="bi bi-file-earmark-zip"></i> zip</span>
             <span><i class="bi bi-archive"></i> unzip</span>
@@ -880,6 +987,8 @@ foreach ($entries as $en) {
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <!-- Single-CDN editor (Ace) -->
+  <script src="https://cdn.jsdelivr.net/npm/ace-builds@1.32.9/src-min-noconflict/ace.js"></script>
   <script>
     (function(){
       const overlay = document.getElementById('pageOverlay');
@@ -1026,6 +1135,133 @@ foreach ($entries as $en) {
           xhr.send(formData);
         });
       }
+
+      // -------- Inline editor (Ace) ----------
+      let aceEditor = null;
+      const aceBase = 'https://cdn.jsdelivr.net/npm/ace-builds@1.32.9/src-min-noconflict/';
+      if (window.ace) {
+        window.ace.config.set('basePath', aceBase);
+      }
+      const editModalEl = document.getElementById('editModal');
+      const editModal = editModalEl ? new bootstrap.Modal(editModalEl) : null;
+      const editTitle = document.getElementById('editTitle');
+      const editItem  = document.getElementById('editItem');
+      const editError = document.getElementById('editError');
+      const btnReload = document.getElementById('btnEditorReload');
+      const btnSave   = document.getElementById('btnEditorSave');
+      const toggleWrap= document.getElementById('toggleWrap');
+      const hiddenContent = document.getElementById('editContent');
+
+      function modeFromExt(ext){
+        ext = (ext||'').toLowerCase();
+        const map = {
+          'php':'php','phtml':'php','inc':'php',
+          'htm':'html','html':'html',
+          'css':'css',
+          'js':'javascript','mjs':'javascript','jsx':'jsx','ts':'typescript','tsx':'tsx',
+          'json':'json',
+          'md':'markdown','markdown':'markdown',
+          'xml':'xml','svg':'xml',
+          'yml':'yaml','yaml':'yaml',
+          'ini':'ini','conf':'ini','config':'ini','env':'ini',
+          'sh':'sh','bash':'sh','zsh':'sh',
+          'py':'python','rb':'ruby','pl':'perl',
+          'c':'c_cpp','h':'c_cpp','cpp':'c_cpp','hpp':'c_cpp','cc':'c_cpp','hh':'c_cpp',
+          'java':'java','cs':'csharp',
+          'sql':'sql',
+          'txt':'text','log':'text','csv':'text','tsv':'text','vue':'vue','svelte':'svelte'
+        };
+        if (!ext) return 'text';
+        return map[ext] || 'text';
+      }
+
+      function ensureAceMode(mode, cb){
+        try {
+          // If already available, just set
+          if (ace.require && ace.require('ace/mode/'+mode)) { cb && cb(); return; }
+        } catch(e){}
+        const id = 'ace-mode-'+mode;
+        if (document.getElementById(id)) { document.getElementById(id).addEventListener('load', ()=>cb && cb()); return; }
+        const s = document.createElement('script');
+        s.src = aceBase + 'mode-' + mode + '.js';
+        s.id = id;
+        s.onload = ()=> cb && cb();
+        s.onerror = ()=> cb && cb(); // fallback to text if load fails
+        document.head.appendChild(s);
+      }
+
+      function openEditor(rel, name){
+        if (!editModal) return;
+        if (editError) { editError.classList.add('d-none'); editError.textContent=''; }
+        if (editTitle) editTitle.textContent = name || rel || '';
+        if (editItem) editItem.value = rel || '';
+        showOverlay();
+        fetch('?read=1&f=' + encodeURIComponent(rel), {headers:{'Accept':'application/json'}})
+          .then(r => r.json())
+          .then(data => {
+            if (!data || !data.ok) throw new Error((data && data.error) ? data.error : 'Read error');
+            if (!aceEditor) {
+              aceEditor = ace.edit('aceEditor');
+              aceEditor.setOptions({ fontSize: '13px', showPrintMargin: false, useSoftTabs: true, tabSize: 2 });
+              aceEditor.session.setUseWrapMode(false);
+            }
+            aceEditor.setValue(data.content || '', -1);
+            const mode = modeFromExt(data.ext || '');
+            ensureAceMode(mode, ()=> {
+              try { aceEditor.session.setMode('ace/mode/' + mode); } catch(ex){}
+            });
+            if (toggleWrap) toggleWrap.checked = false;
+            if (btnSave) btnSave.disabled = !data.writable;
+            editModal.show();
+          })
+          .catch(err => {
+            if (editError) { editError.textContent = err.message || 'Error opening file'; editError.classList.remove('d-none'); }
+          })
+          .finally(()=> hideOverlay());
+      }
+
+      document.querySelectorAll('[data-edit]').forEach(btn=>{
+        btn.addEventListener('click', ()=>{
+          const rel = btn.getAttribute('data-rel');
+          const name= btn.getAttribute('data-name') || rel.split('/').pop();
+          openEditor(rel, name);
+        });
+      });
+
+      if (toggleWrap) {
+        toggleWrap.addEventListener('change', ()=>{
+          if (aceEditor) aceEditor.session.setUseWrapMode(!!toggleWrap.checked);
+        });
+      }
+
+      if (btnReload) {
+        btnReload.addEventListener('click', ()=>{
+          const rel = editItem.value;
+          const name = editTitle.textContent || rel.split('/').pop();
+          openEditor(rel, name);
+        });
+      }
+
+      // Submit save: push editor content into hidden textarea
+      const editForm = document.getElementById('editForm');
+      if (editForm) {
+        editForm.addEventListener('submit', (e)=>{
+          if (!aceEditor) return;
+          hiddenContent.value = aceEditor.getValue();
+          showOverlay();
+        });
+      }
+
+      // Ctrl/Cmd+S to save
+      document.addEventListener('keydown', function(e){
+        const isMac = navigator.platform.toUpperCase().indexOf('MAC')>=0;
+        if ((isMac ? e.metaKey : e.ctrlKey) && e.key.toLowerCase() === 's') {
+          if (editModalEl && editModalEl.classList.contains('show')) {
+            e.preventDefault();
+            if (editForm) editForm.requestSubmit();
+          }
+        }
+      });
 
       // Operation forms: rename/zip/unzip/delete/newfile/newfolder/imgbatch
       document.querySelectorAll('form[data-opform]').forEach(f=>{
