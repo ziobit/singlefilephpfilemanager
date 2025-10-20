@@ -15,3 +15,4 @@ Supports:
 - ZIP a folder and download it
 - Image preview (click on icon, click or ESC to exit)
 - Image change type from JPG/PNG/WEBP to JPG/PNG/WEBP, resize, keep aspect ratio, quality
+- (v1.1) edit text files with syntax highlightin (uses ACE inline editor)
