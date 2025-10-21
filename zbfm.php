@@ -92,7 +92,6 @@ function is_image_ext(string $name): bool {
 function is_text_ext(string $name): bool {
   $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
   if ($ext === '') {
-    // files like .htaccess
     $base = basename($name);
     return in_array($base, ['.htaccess', '.env', 'Dockerfile', 'Makefile']);
   }
@@ -103,6 +102,11 @@ function is_text_ext(string $name): bool {
     'c','h','cpp','hpp','cc','hh','cs','java','kt','go','rs','swift','m','mm',
     'py','rb','pl','sh','bash','zsh','ps1','sql','twig','vue','svelte','jade','ejs','handlebars','hbs'
   ]);
+}
+// Grep-allowed extensions (per request)
+function is_grep_ext(string $name): bool {
+  $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+  return in_array($ext, ['txt','php','phtml','html','htm','css','js']);
 }
 
 // --- GD helpers for image batch ---
@@ -257,6 +261,76 @@ if (isset($_GET['read']) && isset($_GET['f']) && is_authenticated()) {
   echo json_encode(['ok'=>false,'error'=>'Invalid file']); exit;
 }
 
+// GREP-style search (AJAX JSON): recurse from base, only certain text files, return matches with line numbers
+if (isset($_GET['search']) && is_authenticated()) {
+  header('Content-Type: application/json; charset=UTF-8');
+  $q = trim((string)($_GET['q'] ?? ''));
+  $baseRel = (string)($_GET['base'] ?? '');
+  $caseSensitive = ((string)($_GET['cs'] ?? '0') === '1');
+  if ($q === '') { echo json_encode(['ok'=>false,'error'=>'Empty query']); exit; }
+  $baseAbs = secure_path($baseRel);
+  if ($baseAbs === false || !is_dir($baseAbs)) { echo json_encode(['ok'=>false,'error'=>'Invalid base']); exit; }
+
+  $trashReal = realpath(trash_abs()) ?: '';
+  $trashReal = str_replace('\\','/',$trashReal);
+  $results = [];
+  $maxPerFile = 50;
+  $maxTotal = 500;
+  $maxFileSize = 2 * 1024 * 1024; // 2 MB
+  $count = 0;
+
+  try {
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($baseAbs, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $path => $info) {
+      if ($info->isDir()) continue;
+      $real = realpath($path) ?: $path;
+      $realNorm = str_replace('\\','/',$real);
+      if ($trashReal && str_starts_with($realNorm, $trashReal)) continue; // skip .trash
+      $name = $info->getFilename();
+      if (!is_grep_ext($name)) continue;
+      $sz = @filesize($path);
+      if ($sz === false || $sz > $maxFileSize) continue;
+
+      $fh = @fopen($path, 'rb');
+      if (!$fh) continue;
+      $lineNo = 0; $matchesInFile = 0;
+      while (!feof($fh)) {
+        $line = fgets($fh);
+        if ($line === false) break;
+        $lineNo++;
+        $hay = $caseSensitive ? $line : mb_strtolower($line, 'UTF-8');
+        $needle = $caseSensitive ? $q : mb_strtolower($q, 'UTF-8');
+        if ($needle === '' || mb_strpos($hay, $needle) === false) continue;
+
+        $rel = to_rel($real);
+        $trimmed = rtrim($line, "\r\n");
+        $results[] = [
+          'rel' => $rel,
+          'name' => basename($real),
+          'line_no' => $lineNo,
+          'line' => mb_substr($trimmed, 0, 800, 'UTF-8'),
+        ];
+        $matchesInFile++;
+        $count++;
+        if ($matchesInFile >= $maxPerFile) break;
+        if ($count >= $maxTotal) break 2;
+      }
+      fclose($fh);
+    }
+  } catch (Throwable $e) {}
+
+  echo json_encode([
+    'ok' => true,
+    'query' => $q,
+    'caseSensitive' => $caseSensitive,
+    'base' => to_rel($baseAbs),
+    'count' => $count,
+    'truncated' => $count >= $maxTotal,
+    'results' => $results
+  ]);
+  exit;
+}
+
 // File download (keep simple; no token needed)
 if (isset($_GET['download']) && isset($_GET['f']) && is_authenticated()) {
   $rel = (string)$_GET['f']; $abs = secure_path($rel);
@@ -330,7 +404,7 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
   // ---- Upload (AJAX friendly, no overwrite allowed)
   if ($op === 'upload') {
     $isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH']) || ($_POST['ajax'] ?? '')==='1';
-    $baseRel = (string)($_POST['base'] ?? '');
+    $baseRel = (string)$_POST['base'];
     $baseAbs = secure_path($baseRel);
     if ($baseAbs === false || !is_dir($baseAbs)) {
       if ($isAjax) { header('Content-Type: application/json'); echo json_encode(['ok'=>false,'error'=>'Invalid destination']); exit; }
@@ -626,6 +700,10 @@ foreach ($entries as $en) {
     .usage-bar { height: 100%; background: #0d6efd; }
     .editor-wrap { height: 70vh; border: 1px solid rgba(0,0,0,.125); border-radius: .25rem; }
     #aceEditor { width: 100%; height: 100%; }
+    /* Grep results */
+    #grepResultsWrap { display:none; }
+    .grep-line { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .grep-item .badge { font-weight: 500; }
   </style>
 </head>
 <body class="bg-light">
@@ -747,7 +825,36 @@ foreach ($entries as $en) {
       <div class="card shadow-sm mb-3">
         <div class="card-body">
           <?=breadcrumbs($relNow)?>
-          <div class="d-flex justify-content-between align-items-center">
+
+          <!-- Grep search row -->
+          <form class="row g-2 align-items-center mb-3" id="grepForm">
+            <div class="col-12 col-md">
+              <input type="text" class="form-control" id="grepInput" placeholder="Search recursively from current folder (txt/php/html/css/js)…" autocomplete="off">
+            </div>
+            <div class="col-auto">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="grepCS">
+                <label class="form-check-label" for="grepCS">Case sensitive</label>
+              </div>
+            </div>
+            <div class="col-auto">
+              <button type="submit" class="btn btn-primary"><i class="bi bi-search"></i> Search</button>
+            </div>
+            <div class="col-auto">
+              <button type="button" class="btn btn-outline-secondary" id="grepClear"><i class="bi bi-x-circle"></i> Clear</button>
+            </div>
+          </form>
+
+          <div id="grepResultsWrap" class="card border-0">
+            <div class="card-header bg-white d-flex justify-content-between align-items-center">
+              <div><i class="bi bi-list-check"></i> Search results</div>
+              <div class="small text-muted"><span id="grepCount">0</span> matches</div>
+            </div>
+            <div class="list-group list-group-flush" id="grepList"></div>
+            <div class="card-footer small text-muted d-none" id="grepTrunc">Results truncated.</div>
+          </div>
+
+          <div class="d-flex justify-content-between align-items-center mt-3">
             <div><strong>Current:</strong> <span class="mono"><?=htmlspecialchars($abs)?></span></div>
             <div class="d-flex gap-2">
               <!-- Upload (comes BEFORE new file/new folder) -->
@@ -1151,6 +1258,7 @@ foreach ($entries as $en) {
       const btnSave   = document.getElementById('btnEditorSave');
       const toggleWrap= document.getElementById('toggleWrap');
       const hiddenContent = document.getElementById('editContent');
+      let pendingGotoLine = null;
 
       function modeFromExt(ext){
         ext = (ext||'').toLowerCase();
@@ -1177,7 +1285,6 @@ foreach ($entries as $en) {
 
       function ensureAceMode(mode, cb){
         try {
-          // If already available, just set
           if (ace.require && ace.require('ace/mode/'+mode)) { cb && cb(); return; }
         } catch(e){}
         const id = 'ace-mode-'+mode;
@@ -1186,17 +1293,19 @@ foreach ($entries as $en) {
         s.src = aceBase + 'mode-' + mode + '.js';
         s.id = id;
         s.onload = ()=> cb && cb();
-        s.onerror = ()=> cb && cb(); // fallback to text if load fails
+        s.onerror = ()=> cb && cb();
         document.head.appendChild(s);
       }
 
-      function openEditor(rel, name){
+      function openEditor(rel, name, line){
         if (!editModal) return;
         if (editError) { editError.classList.add('d-none'); editError.textContent=''; }
         if (editTitle) editTitle.textContent = name || rel || '';
         if (editItem) editItem.value = rel || '';
+        pendingGotoLine = Number.isInteger(line) ? line : null;
+
         showOverlay();
-        fetch('?read=1&f=' + encodeURIComponent(rel), {headers:{'Accept':'application/json'}})
+        fetch('?search=0&read=1&f=' + encodeURIComponent(rel), {headers:{'Accept':'application/json'}})
           .then(r => r.json())
           .then(data => {
             if (!data || !data.ok) throw new Error((data && data.error) ? data.error : 'Read error');
@@ -1209,6 +1318,9 @@ foreach ($entries as $en) {
             const mode = modeFromExt(data.ext || '');
             ensureAceMode(mode, ()=> {
               try { aceEditor.session.setMode('ace/mode/' + mode); } catch(ex){}
+              if (pendingGotoLine) {
+                try { aceEditor.gotoLine(pendingGotoLine, 0, true); } catch(e){}
+              }
             });
             if (toggleWrap) toggleWrap.checked = false;
             if (btnSave) btnSave.disabled = !data.writable;
@@ -1238,7 +1350,7 @@ foreach ($entries as $en) {
         btnReload.addEventListener('click', ()=>{
           const rel = editItem.value;
           const name = editTitle.textContent || rel.split('/').pop();
-          openEditor(rel, name);
+          openEditor(rel, name, pendingGotoLine || null);
         });
       }
 
@@ -1262,6 +1374,101 @@ foreach ($entries as $en) {
           }
         }
       });
+
+      // ---------- GREP UI ----------
+      const grepForm = document.getElementById('grepForm');
+      const grepInput = document.getElementById('grepInput');
+      const grepCS = document.getElementById('grepCS');
+      const grepClear = document.getElementById('grepClear');
+      const grepWrap = document.getElementById('grepResultsWrap');
+      const grepList = document.getElementById('grepList');
+      const grepCount = document.getElementById('grepCount');
+      const grepTrunc = document.getElementById('grepTrunc');
+
+      function esc(s){
+        return (s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+      }
+      function regexEscape(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+      function highlight(line, q, cs){
+        if (!q) return esc(line);
+        try {
+          const re = new RegExp(regexEscape(q), cs ? 'g' : 'gi');
+          return esc(line).replace(re, m => `<mark>${esc(m)}</mark>`);
+        } catch(e){ return esc(line); }
+      }
+
+      function renderGrep(data, q){
+        if (!grepWrap || !grepList || !grepCount) return;
+        grepList.innerHTML = '';
+        if (!data || !data.ok) {
+          grepWrap.style.display = 'none';
+          return;
+        }
+        const res = data.results || [];
+        grepCount.textContent = data.count || res.length || 0;
+        if (grepTrunc) grepTrunc.classList.toggle('d-none', !data.truncated);
+        if (res.length === 0) {
+          grepList.innerHTML = `<div class="list-group-item text-muted">No matches.</div>`;
+          grepWrap.style.display = 'block';
+          return;
+        }
+        const frag = document.createDocumentFragment();
+        res.forEach(r=>{
+          const item = document.createElement('div');
+          item.className = 'list-group-item grep-item';
+          item.innerHTML = `
+            <div class="d-flex justify-content-between align-items-center">
+              <div class="mono">
+                <span class="badge bg-light text-dark border">L${r.line_no}</span>
+                <span class="text-secondary">/</span>
+                <span class="text-primary">${esc(r.rel || r.name || '')}</span>
+              </div>
+              <div>
+                <button class="btn btn-sm btn-outline-primary" data-edit-rel="${esc(r.rel)}" data-edit-name="${esc(r.name)}" data-edit-line="${r.line_no}">
+                  <i class="bi bi-pencil-square"></i> Edit
+                </button>
+              </div>
+            </div>
+            <div class="grep-line mt-2">${highlight(r.line || '', q, !!data.caseSensitive)}</div>
+          `;
+          frag.appendChild(item);
+        });
+        grepList.appendChild(frag);
+        grepWrap.style.display = 'block';
+      }
+
+      if (grepForm) {
+        grepForm.addEventListener('submit', (e)=>{
+          e.preventDefault();
+          const q = (grepInput && grepInput.value) ? grepInput.value.trim() : '';
+          if (!q) return;
+          const cs = grepCS && grepCS.checked ? 1 : 0;
+          const params = new URLSearchParams({search:'1', q, base:'<?=htmlspecialchars(to_rel($abs))?>', cs:String(cs)});
+          showOverlay();
+          fetch('?' + params.toString(), {headers:{'Accept':'application/json'}})
+            .then(r=>r.json())
+            .then(data=> renderGrep(data, q))
+            .catch(()=> { renderGrep({ok:false}, q); })
+            .finally(()=> hideOverlay());
+        });
+      }
+      if (grepClear) {
+        grepClear.addEventListener('click', ()=>{
+          if (grepInput) grepInput.value = '';
+          if (grepWrap) grepWrap.style.display = 'none';
+          if (grepList) grepList.innerHTML = '';
+        });
+      }
+      if (grepList) {
+        grepList.addEventListener('click', (e)=>{
+          const btn = e.target.closest('button[data-edit-rel]');
+          if (!btn) return;
+          const rel = btn.getAttribute('data-edit-rel');
+          const name = btn.getAttribute('data-edit-name') || (rel ? rel.split('/').pop() : '');
+          const line = parseInt(btn.getAttribute('data-edit-line') || '0', 10) || null;
+          openEditor(rel, name, line);
+        });
+      }
 
       // Operation forms: rename/zip/unzip/delete/newfile/newfolder/imgbatch
       document.querySelectorAll('form[data-opform]').forEach(f=>{
