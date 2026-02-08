@@ -19,7 +19,9 @@ function flash_get(): ?string { $m = $_SESSION['zip_manager_flash'] ?? null; uns
 
 function secure_path(string $rel) {
   $rel = str_replace(["\0"], '', $rel);
-  $parts = array_filter(explode('/', str_replace('\\','/',$rel)), fn($p)=> $p!=='' && $p!=='.' && $p!=='..');
+  $parts = array_filter(explode('/', str_replace('\\','/',$rel)), function ($p) {
+    return $p !== '' && $p !== '.' && $p !== '..';
+  });
   $clean = implode(DIRECTORY_SEPARATOR, $parts);
   $candidate = BASE_ROOT . DIRECTORY_SEPARATOR . $clean;
   $abs = realpath($candidate);
@@ -50,7 +52,7 @@ function is_in_trash(string $absPath): bool {
   return ($t !== '' && strpos($p, $t) === 0);
 }
 
-function size_human(int|float $bytes): string {
+function size_human($bytes): string {
   $u = ['B','KB','MB','GB','TB']; $i=0; $val=max(0,(float)$bytes);
   while ($val>=1024 && $i<count($u)-1){ $val/=1024; $i++; }
   return number_format($val, ($i===0?0:2)).' '.$u[$i];
@@ -285,7 +287,7 @@ if (isset($_GET['search']) && is_authenticated()) {
       if ($info->isDir()) continue;
       $real = realpath($path) ?: $path;
       $realNorm = str_replace('\\','/',$real);
-      if ($trashReal && str_starts_with($realNorm, $trashReal)) continue; // skip .trash
+      if ($trashReal && strpos($realNorm, $trashReal) === 0) continue; // skip .trash
       $name = $info->getFilename();
       if (!is_grep_ext($name)) continue;
       $sz = @filesize($path);
@@ -682,9 +684,10 @@ foreach ($entries as $en) {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Zip Manager & File Browser</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
   <style>
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .material-icons { font-size: 18px; vertical-align: middle; line-height: 1; }
     .table td, .table th { vertical-align: middle; }
     #pageOverlay { position: fixed; inset: 0; z-index: 2000; background: rgba(0,0,0,.45); display: none; }
     #pageOverlay.show { display: block; }
@@ -728,7 +731,7 @@ foreach ($entries as $en) {
         <input type="hidden" name="base" value="<?=htmlspecialchars(to_rel($abs))?>">
         <input type="hidden" name="ajax" value="1">
         <div class="modal-header">
-          <h5 class="modal-title"><i class="bi bi-upload"></i> Upload a file</h5>
+          <h5 class="modal-title"><span class="material-icons" aria-hidden="true">upload</span> Upload a file</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
@@ -745,7 +748,7 @@ foreach ($entries as $en) {
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
-          <button type="submit" class="btn btn-primary" id="uploadStartBtn"><i class="bi bi-cloud-arrow-up"></i> Start upload</button>
+          <button type="submit" class="btn btn-primary" id="uploadStartBtn"><span class="material-icons" aria-hidden="true">cloud_upload</span> Start upload</button>
         </div>
       </form>
     </div>
@@ -759,14 +762,14 @@ foreach ($entries as $en) {
         <input type="hidden" name="item" id="editItem" value="">
         <textarea name="content" id="editContent" style="display:none;"></textarea>
         <div class="modal-header">
-          <h5 class="modal-title"><i class="bi bi-code-slash"></i> Edit: <span id="editTitle" class="mono"></span></h5>
+          <h5 class="modal-title"><span class="material-icons" aria-hidden="true">code</span> Edit: <span id="editTitle" class="mono"></span></h5>
           <div class="ms-auto d-flex align-items-center gap-2">
             <div class="form-check form-switch">
               <input class="form-check-input" type="checkbox" id="toggleWrap">
               <label class="form-check-label" for="toggleWrap">Wrap</label>
             </div>
-            <button type="button" class="btn btn-light btn-sm" id="btnEditorReload" title="Reload from disk"><i class="bi bi-arrow-clockwise"></i></button>
-            <button type="submit" class="btn btn-primary btn-sm" id="btnEditorSave"><i class="bi bi-save"></i> Save (Ctrl+S)</button>
+            <button type="button" class="btn btn-light btn-sm" id="btnEditorReload" title="Reload from disk"><span class="material-icons" aria-hidden="true">refresh</span></button>
+            <button type="submit" class="btn btn-primary btn-sm" id="btnEditorSave"><span class="material-icons" aria-hidden="true">save</span> Save (Ctrl+S)</button>
             <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Close</button>
           </div>
         </div>
@@ -792,7 +795,7 @@ foreach ($entries as $en) {
           <a class="btn btn-sm btn-outline-secondary" data-folder-link href="?">Root</a>
           <form method="post" class="d-inline" id="emptyTrashForm">
             <input type="hidden" name="op" value="emptytrash">
-            <button class="btn btn-sm btn-outline-danger" type="submit"><i class="bi bi-trash3"></i> Empty Trash</button>
+            <button class="btn btn-sm btn-outline-danger" type="submit"><span class="material-icons" aria-hidden="true">delete</span> Empty Trash</button>
           </form>
           <a class="btn btn-sm btn-outline-secondary" href="?action=logout">Logout</a>
         </div>
@@ -838,16 +841,16 @@ foreach ($entries as $en) {
               </div>
             </div>
             <div class="col-auto">
-              <button type="submit" class="btn btn-primary"><i class="bi bi-search"></i> Search</button>
+              <button type="submit" class="btn btn-primary"><span class="material-icons" aria-hidden="true">search</span> Search</button>
             </div>
             <div class="col-auto">
-              <button type="button" class="btn btn-outline-secondary" id="grepClear"><i class="bi bi-x-circle"></i> Clear</button>
+              <button type="button" class="btn btn-outline-secondary" id="grepClear"><span class="material-icons" aria-hidden="true">clear</span> Clear</button>
             </div>
           </form>
 
           <div id="grepResultsWrap" class="card border-0">
             <div class="card-header bg-white d-flex justify-content-between align-items-center">
-              <div><i class="bi bi-list-check"></i> Search results</div>
+              <div><span class="material-icons" aria-hidden="true">playlist_add_check</span> Search results</div>
               <div class="small text-muted"><span id="grepCount">0</span> matches</div>
             </div>
             <div class="list-group list-group-flush" id="grepList"></div>
@@ -858,7 +861,7 @@ foreach ($entries as $en) {
             <div><strong>Current:</strong> <span class="mono"><?=htmlspecialchars($abs)?></span></div>
             <div class="d-flex gap-2">
               <!-- Upload (comes BEFORE new file/new folder) -->
-              <button class="btn btn-sm btn-success" type="button" id="btnUpload"><i class="bi bi-upload"></i> Upload</button>
+              <button class="btn btn-sm btn-success" type="button" id="btnUpload"><span class="material-icons" aria-hidden="true">upload</span> Upload</button>
 
               <!-- New file / New folder buttons -->
               <form method="post" class="d-inline" data-opform="newfile">
@@ -866,7 +869,7 @@ foreach ($entries as $en) {
                 <input type="hidden" name="base" value="<?=htmlspecialchars($relNow)?>">
                 <input type="hidden" name="newname" value="">
                 <button class="btn btn-sm btn-outline-primary" type="submit">
-                  <i class="bi bi-file-earmark-plus"></i> New file
+                  <span class="material-icons" aria-hidden="true">note_add</span> New file
                 </button>
               </form>
               <form method="post" class="d-inline" data-opform="newfolder">
@@ -874,15 +877,15 @@ foreach ($entries as $en) {
                 <input type="hidden" name="base" value="<?=htmlspecialchars($relNow)?>">
                 <input type="hidden" name="newname" value="">
                 <button class="btn btn-sm btn-outline-primary" type="submit">
-                  <i class="bi bi-folder-plus"></i> New folder
+                  <span class="material-icons" aria-hidden="true">create_new_folder</span> New folder
                 </button>
               </form>
 
               <!-- Up button -->
               <?php if ($relNow !== ''): ?>
-                <a class="btn btn-sm btn-outline-secondary" data-folder-link href="?p=<?=rawurlencode($upRel)?>">⬆️ Up</a>
+                <a class="btn btn-sm btn-outline-secondary" data-folder-link href="?p=<?=rawurlencode($upRel)?>"><span class="material-icons" aria-hidden="true">arrow_upward</span> Up</a>
               <?php else: ?>
-                <button class="btn btn-sm btn-outline-secondary" disabled>⬆️ Up</button>
+                <button class="btn btn-sm btn-outline-secondary" disabled><span class="material-icons" aria-hidden="true">arrow_upward</span> Up</button>
               <?php endif; ?>
             </div>
           </div>
@@ -927,17 +930,17 @@ foreach ($entries as $en) {
                       <div class="icon-row">
                         <?php if (!$isDir): ?>
                           <a class="icon-btn" title="Download" href="?download=1&f=<?=rawurlencode($nextRel)?>" data-download>
-                            <i class="bi bi-download"></i>
+                            <span class="material-icons" aria-hidden="true">download</span>
                           </a>
                         <?php else: ?>
                           <a class="icon-btn" title="Download (zip)" href="#" data-download-folder data-rel="<?=htmlspecialchars($nextRel)?>" data-name="<?=htmlspecialchars($name)?>">
-                            <i class="bi bi-download"></i>
+                            <span class="material-icons" aria-hidden="true">download</span>
                           </a>
                         <?php endif; ?>
 
                         <?php if ($isText): ?>
                           <button type="button" class="icon-btn" title="Edit" data-edit data-rel="<?=htmlspecialchars($nextRel)?>" data-name="<?=htmlspecialchars($name)?>">
-                            <i class="bi bi-code-slash"></i>
+                            <span class="material-icons" aria-hidden="true">code</span>
                           </button>
                         <?php endif; ?>
 
@@ -945,21 +948,21 @@ foreach ($entries as $en) {
                           <input type="hidden" name="op" value="rename">
                           <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                           <input type="hidden" name="newname" value="">
-                          <button type="submit" class="icon-btn" title="Rename"><i class="bi bi-pencil-square"></i></button>
+                          <button type="submit" class="icon-btn" title="Rename"><span class="material-icons" aria-hidden="true">edit</span></button>
                         </form>
 
                         <form method="post" class="d-inline" data-opform="zip">
                           <input type="hidden" name="op" value="zip">
                           <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                           <input type="hidden" name="zipname" value="">
-                          <button type="submit" class="icon-btn" title="Zip"><i class="bi bi-file-earmark-zip"></i></button>
+                          <button type="submit" class="icon-btn" title="Zip"><span class="material-icons" aria-hidden="true">folder_zip</span></button>
                         </form>
 
                         <form method="post" class="d-inline" data-opform="unzip">
                           <input type="hidden" name="op" value="unzip">
                           <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                           <button type="submit" class="icon-btn" title="Unzip" <?= $isZip ? '' : 'disabled' ?>>
-                            <i class="bi bi-archive"></i>
+                            <span class="material-icons" aria-hidden="true">unarchive</span>
                           </button>
                         </form>
 
@@ -967,7 +970,7 @@ foreach ($entries as $en) {
                           <input type="hidden" name="op" value="delete">
                           <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                           <button type="submit" class="icon-btn" title="Delete">
-                            <i class="bi bi-trash text-danger"></i>
+                            <span class="material-icons text-danger" aria-hidden="true">delete</span>
                           </button>
                         </form>
                       </div>
@@ -1004,12 +1007,12 @@ foreach ($entries as $en) {
 
         <div class="card-footer">
           <div class="small text-muted d-flex flex-wrap gap-3">
-            <span><i class="bi bi-download"></i> download</span>
-            <span><i class="bi bi-code-slash"></i> edit</span>
-            <span><i class="bi bi-pencil-square"></i> rename</span>
-            <span><i class="bi bi-file-earmark-zip"></i> zip</span>
-            <span><i class="bi bi-archive"></i> unzip</span>
-            <span><i class="bi bi-trash text-danger"></i> delete</span>
+            <span><span class="material-icons" aria-hidden="true">download</span> download</span>
+            <span><span class="material-icons" aria-hidden="true">code</span> edit</span>
+            <span><span class="material-icons" aria-hidden="true">edit</span> rename</span>
+            <span><span class="material-icons" aria-hidden="true">folder_zip</span> zip</span>
+            <span><span class="material-icons" aria-hidden="true">unarchive</span> unzip</span>
+            <span><span class="material-icons text-danger" aria-hidden="true">delete</span> delete</span>
           </div>
         </div>
       </div>
@@ -1077,7 +1080,7 @@ foreach ($entries as $en) {
 
             <div class="col-12 col-md-3 text-md-end">
               <button type="submit" class="btn btn-primary">
-                <i class="bi bi-magic"></i> Run
+                <span class="material-icons" aria-hidden="true">auto_fix_high</span> Run
               </button>
             </div>
           </form>
@@ -1221,7 +1224,7 @@ foreach ($entries as $en) {
           });
           xhr.onreadystatechange = function(){
             if (xhr.readyState === 4) {
-              if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-cloud-arrow-up"></i> Start upload'; }
+              if (btn) { btn.disabled = false; btn.innerHTML = '<span class="material-icons" aria-hidden="true">cloud_upload</span> Start upload'; }
               try {
                 const res = JSON.parse(xhr.responseText || '{}');
                 if (xhr.status === 200 && res.ok) {
@@ -1425,7 +1428,7 @@ foreach ($entries as $en) {
               </div>
               <div>
                 <button class="btn btn-sm btn-outline-primary" data-edit-rel="${esc(r.rel)}" data-edit-name="${esc(r.name)}" data-edit-line="${r.line_no}">
-                  <i class="bi bi-pencil-square"></i> Edit
+                  <span class="material-icons" aria-hidden="true">edit</span> Edit
                 </button>
               </div>
             </div>
