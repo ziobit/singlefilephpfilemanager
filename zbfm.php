@@ -1,26 +1,91 @@
 <?php
 
+$__isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+  || (isset($_SERVER['SERVER_PORT']) && (string)$_SERVER['SERVER_PORT'] === '443');
+
+ini_set('session.use_strict_mode', '1');
+ini_set('session.cookie_httponly', '1');
+ini_set('session.cookie_samesite', 'Lax');
+if ($__isHttps) ini_set('session.cookie_secure', '1');
+
+session_set_cookie_params([
+  'lifetime' => 0,
+  'path' => '/',
+  'secure' => $__isHttps,
+  'httponly' => true,
+  'samesite' => 'Lax',
+]);
+
 session_start();
-const AUTH_PASSWORD    = '12345678';  // Change this password as needed
+const AUTH_PASSWORD_HASH = '$2y$10$vQ3E.u2tK1jX8/bH8uH/G.T.R1Zq/yQ8.lZ.u.F.v.t.w.R.O.K';
 const AUTH_SESSION_KEY = 'zip_manager_auth';
+const SESSION_TIMEOUT  = 3600;        // 1 hour session expiry
 const BASE_ROOT        = __DIR__;
 const TRASH_DIR        = '.trash';
 
-function is_authenticated(): bool { return !empty($_SESSION[AUTH_SESSION_KEY]); }
+function is_authenticated(): bool { 
+  if (empty($_SESSION[AUTH_SESSION_KEY])) return false;
+  if (time() - $_SESSION[AUTH_SESSION_KEY] > SESSION_TIMEOUT) {
+    logout_auth();
+    return false;
+  }
+  $_SESSION[AUTH_SESSION_KEY] = time(); // Refresh timeout
+  return true; 
+}
+
 function try_authenticate(): bool {
   if (!isset($_POST['password'])) return false;
-  if ((string)$_POST['password'] === AUTH_PASSWORD) { $_SESSION[AUTH_SESSION_KEY] = time(); return true; }
+  
+  $attempts = $_SESSION['login_attempts'] ?? 0;
+  $lockout = $_SESSION['login_lockout'] ?? 0;
+  
+  if (time() < $lockout) return false;
+
+  if (password_verify((string)$_POST['password'], AUTH_PASSWORD_HASH)) { 
+    session_regenerate_id(true); 
+    $_SESSION[AUTH_SESSION_KEY] = time(); 
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    unset($_SESSION['login_attempts'], $_SESSION['login_lockout']);
+    return true; 
+  }
+  
+  $_SESSION['login_attempts'] = $attempts + 1;
+  if ($_SESSION['login_attempts'] >= 5) {
+    $_SESSION['login_lockout'] = time() + 300; 
+  }
+  
   return false;
 }
-function logout_auth(): void { unset($_SESSION[AUTH_SESSION_KEY]); }
+
+function logout_auth(): void { 
+  unset($_SESSION[AUTH_SESSION_KEY], $_SESSION['csrf_token']); 
+}
 
 function flash_set(string $msg): void { $_SESSION['zip_manager_flash'] = $msg; }
 function flash_get(): ?string { $m = $_SESSION['zip_manager_flash'] ?? null; unset($_SESSION['zip_manager_flash']); return $m; }
 
+// Enforce CSRF for ALL POST requests (except login)
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  if (is_authenticated()) {
+    $token = $_POST['csrf_token'] ?? '';
+    if (empty($_SESSION['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $token)) {
+      if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) || ($_POST['ajax'] ?? '') === '1' || isset($_POST['op']) && in_array($_POST['op'], ['move', 'copy', 'bulk_delete', 'bulk_move', 'bulk_copy', 'bulk_zip'])) {
+        header('Content-Type: application/json');
+        echo json_encode(['ok' => false, 'error' => 'Invalid CSRF token.']);
+        exit;
+      }
+      flash_set('Invalid CSRF token. Please try again.');
+      header('Location: ' . basename(__FILE__) . (isset($_GET['p']) ? '?p=' . urlencode($_GET['p']) : ''));
+      exit;
+    }
+  }
+}
+
 function secure_path(string $rel) {
   $rel = str_replace(["\0"], '', $rel);
+  if (strpos($rel, '..') !== false) return false;
   $parts = array_filter(explode('/', str_replace('\\','/',$rel)), function ($p) {
-    return $p !== '' && $p !== '.' && $p !== '..';
+    return $p !== '' && $p !== '.';
   });
   $clean = implode(DIRECTORY_SEPARATOR, $parts);
   $candidate = BASE_ROOT . DIRECTORY_SEPARATOR . $clean;
@@ -30,15 +95,18 @@ function secure_path(string $rel) {
   if ($rootReal === false) return false;
   $absNorm = str_replace('\\','/',$abs);
   $rootNorm= str_replace('\\','/',$rootReal);
-  if (strpos($absNorm, $rootNorm) !== 0) return false;
+  if ($absNorm !== $rootNorm && strpos($absNorm . '/', $rootNorm . '/') !== 0) return false;
   return $abs;
 }
+
 function to_rel(string $abs): string {
   $root = str_replace('\\','/', realpath(BASE_ROOT));
   $abs  = str_replace('\\','/', $abs);
-  if ($root && strpos($abs, $root) === 0) return ltrim(substr($abs, strlen($root)), '/');
+  if ($root === $abs) return '';
+  if ($root && strpos($abs . '/', $root . '/') === 0) return ltrim(substr($abs, strlen($root)), '/');
   return '';
 }
+
 function href(array $params): string {
   $q = http_build_query($params);
   return $q === '' ? '?' : ('?' . $q);
@@ -49,12 +117,13 @@ function trash_abs(): string {
   if ($p && !is_dir($p)) @mkdir($p, 0755, true);
   return $p ?: (BASE_ROOT . DIRECTORY_SEPARATOR . TRASH_DIR);
 }
+
 function is_in_trash(string $absPath): bool {
   $t = realpath(trash_abs());
   $p = realpath($absPath) ?: $absPath;
-  $t = $t ? str_replace('\\','/',$t) : '';
-  $p = str_replace('\\','/',$p);
-  return ($t !== '' && strpos($p, $t) === 0);
+  $t = $t ? rtrim(str_replace('\\','/',$t), '/') : '';
+  $p = rtrim(str_replace('\\','/',$p), '/');
+  return ($t !== '' && ($p === $t || strpos($p, $t . '/') === 0));
 }
 
 function size_human($bytes): string {
@@ -62,6 +131,7 @@ function size_human($bytes): string {
   while ($val>=1024 && $i<count($u)-1){ $val/=1024; $i++; }
   return number_format($val, ($i===0?0:2)).' '.$u[$i];
 }
+
 function dir_size_recursive(string $dir): int {
   $total=0; if (!is_dir($dir) || !is_readable($dir)) return 0;
   try {
@@ -70,6 +140,7 @@ function dir_size_recursive(string $dir): int {
   } catch(Throwable $e){}
   return $total;
 }
+
 function list_directory(string $absDir): array {
   $out=[]; if(!is_dir($absDir)||!is_readable($absDir)) return $out;
   $dh=opendir($absDir); if(!$dh) return $out;
@@ -82,6 +153,7 @@ function list_directory(string $absDir): array {
   }
   closedir($dh); return $out;
 }
+
 function sort_entries(array &$entries, string $sort, string $dir): void {
   $mul = (strtolower($dir)==='desc')?-1:1;
   if ($sort==='name'){
@@ -92,10 +164,12 @@ function sort_entries(array &$entries, string $sort, string $dir): void {
     usort($entries,function($a,$b)use($mul){ $c=$a['mtime']<=>$b['mtime']; if($c===0) $c=strcasecmp($a['name'],$b['name']); return $mul*$c; });
   }
 }
+
 function is_image_ext(string $name): bool {
   $ext=strtolower(pathinfo($name,PATHINFO_EXTENSION));
   return in_array($ext,['jpg','jpeg','png','gif','webp','bmp','svg']);
 }
+
 function is_text_ext(string $name): bool {
   $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
   if ($ext === '') {
@@ -110,25 +184,23 @@ function is_text_ext(string $name): bool {
     'py','rb','pl','sh','bash','zsh','ps1','sql','twig','vue','svelte','jade','ejs','handlebars','hbs'
   ]);
 }
-// Grep-allowed extensions (per request)
+
 function is_grep_ext(string $name): bool {
   $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
   return in_array($ext, ['txt','php','phtml','html','htm','css','js']);
 }
+
 function ext_norm(string $fn): string {
   $e=strtolower(pathinfo($fn, PATHINFO_EXTENSION));
   if ($e==='jpeg') $e='jpg';
   return $e;
 }
 
-/* ============================
-   STATS HELPERS (NEW)
-   ============================ */
-
 function is_code_lang_ext(string $name): bool {
   $e = strtolower(pathinfo($name, PATHINFO_EXTENSION));
   return in_array($e, ['php','phtml','inc','phps','js','mjs','jsx','ts','tsx','html','htm','css'], true);
 }
+
 function code_lang_key(string $name): ?string {
   $e = strtolower(pathinfo($name, PATHINFO_EXTENSION));
   if (in_array($e, ['php','phtml','inc','phps'], true)) return 'php';
@@ -138,18 +210,21 @@ function code_lang_key(string $name): ?string {
   if ($e === 'css') return 'css';
   return null;
 }
+
 function top_key(array $counts): ?string {
   if (empty($counts)) return null;
   arsort($counts);
   foreach ($counts as $k => $v) return (string)$k;
   return null;
 }
+
 function top_key_with_count(array $counts): ?array {
   if (empty($counts)) return null;
   arsort($counts);
   foreach ($counts as $k => $v) return [(string)$k, (int)$v];
   return null;
 }
+
 function safe_zip_name(string $zipName): ?string {
   $zipName = trim((string)$zipName);
   if ($zipName === '') return null;
@@ -157,10 +232,6 @@ function safe_zip_name(string $zipName): ?string {
   if (!preg_match('/^[A-Za-z0-9 _\-\.\(\)]+\.zip$/', $zipName)) return null;
   return $zipName;
 }
-
-/* ============================
-   GD helpers for image batch
-   ============================ */
 
 function gd_load(string $path, string $ext, ?string &$err) {
   $err=null; $ext=strtolower($ext);
@@ -173,6 +244,7 @@ function gd_load(string $path, string $ext, ?string &$err) {
   }
   $err='Unsupported input format: '.$ext; return false;
 }
+
 function gd_save($im, string $path, string $ext, int $quality, ?string &$err): bool {
   $err=null; $ext=strtolower($ext); $quality=max(1,min(100,$quality));
   if ($ext==='jpg' || $ext==='jpeg') { return @imagejpeg($im, $path, $quality) ?: ($err='Save JPEG failed.'); }
@@ -188,10 +260,6 @@ function gd_save($im, string $path, string $ext, int $quality, ?string &$err): b
   }
   $err='Unsupported output format: '.$ext; return false;
 }
-
-/* ============================
-   Zip/unzip
-   ============================ */
 
 function create_zip_from(string $srcAbs, string $zipAbs, ?string &$error = null): bool {
   $error=null; $za=new ZipArchive();
@@ -266,39 +334,87 @@ function create_zip_selected(array $absItems, string $zipAbs, ?string &$error=nu
 }
 
 function unzip_to_folder_and_delete(string $zipAbsPath, ?string &$error = null): bool {
-  $error=null; if(!is_file($zipAbsPath)){ $error='Zip not found.'; return false; }
-  $dir=dirname($zipAbsPath); $base=pathinfo($zipAbsPath,PATHINFO_FILENAME);
-  $target=$dir.DIRECTORY_SEPARATOR.$base; if(file_exists($target)) $target.='_'.time();
-  $za=new ZipArchive(); if($za->open($zipAbsPath)!==true){ $error='Cannot open zip.'; return false; }
-  for($i=0;$i<$za->numFiles;$i++){ $entry=$za->getNameIndex($i);
-    if($entry===null||strpos($entry,'..')!==false||preg_match('#(^/|\\\\)#',$entry)||strpos($entry,':')!==false){ $za->close(); $error='Invalid path inside zip.'; return false; } }
-  if(!@mkdir($target,0755,true)){ $za->close(); $error='Cannot create target.'; return false; }
-  if(!$za->extractTo($target)){ $za->close(); $error='Extraction failed.'; @rmdir($target); return false; }
-  $za->close(); if(!@unlink($zipAbsPath)){ $error='Extracted, but cannot delete zip.'; return false; }
+  $error = null;
+  if (!is_file($zipAbsPath)) { $error = 'Zip not found.'; return false; }
+  $dir = dirname($zipAbsPath);
+  $base = pathinfo($zipAbsPath, PATHINFO_FILENAME);
+  $target = $dir . DIRECTORY_SEPARATOR . $base;
+  if (file_exists($target)) $target .= '_' . uniqid();
+  
+  $za = new ZipArchive();
+  if ($za->open($zipAbsPath) !== true) { $error = 'Cannot open zip.'; return false; }
+  
+  $maxUncompressedSize = 500 * 1024 * 1024; // 500 MB limit
+  $totalSize = 0;
+  
+  for ($i = 0; $i < $za->numFiles; $i++) {
+    $stat = $za->statIndex($i);
+    $entry = $stat['name'] ?? null;
+    if ($entry === null || strpos($entry, '..') !== false || preg_match('#(^/|\\\\)#', $entry) || strpos($entry, ':') !== false) {
+      $za->close(); $error = 'Invalid path inside zip.'; return false;
+    }
+    $totalSize += $stat['size'];
+    if ($totalSize > $maxUncompressedSize) {
+      $za->close(); $error = 'Zip bomb detected: exceeds max uncompressed size.'; return false;
+    }
+  }
+  
+  if (!@mkdir($target, 0755, true)) { $za->close(); $error = 'Cannot create target.'; return false; }
+  
+  for ($i = 0; $i < $za->numFiles; $i++) {
+    $stat = $za->statIndex($i);
+    $entry = $stat['name'];
+    $destPath = $target . DIRECTORY_SEPARATOR . $entry;
+    
+    if (substr($entry, -1) === '/') {
+      @mkdir($destPath, 0755, true);
+      continue;
+    }
+    
+    @mkdir(dirname($destPath), 0755, true);
+    $fp = $za->getStream($entry);
+    if (!$fp) continue;
+    $destFp = @fopen($destPath, 'wb');
+    if ($destFp) {
+      stream_copy_to_stream($fp, $destFp);
+      fclose($destFp);
+    }
+    fclose($fp);
+  }
+  
+  $za->close();
+  if (!@unlink($zipAbsPath)) { $error = 'Extracted, but cannot delete zip.'; return false; }
   return true;
 }
 
 function rrmdir(string $dir): bool {
   if (!is_dir($dir)) return @unlink($dir);
-  $it=new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS);
+  $it = new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS);
   foreach (new RecursiveIteratorIterator($it, RecursiveIteratorIterator::CHILD_FIRST) as $path) {
-    if ($path->isDir()) @rmdir($path->getRealPath());
-    else @unlink($path->getRealPath());
+    if ($path->isLink()) {
+      @unlink($path->getPathname());
+    } elseif ($path->isDir()) {
+      @rmdir($path->getPathname());
+    } else {
+      @unlink($path->getPathname());
+    }
   }
   return @rmdir($dir);
 }
+
 function delete_item(string $absPath, ?string &$error = null): bool {
   $error=null; if(!file_exists($absPath)){ $error='Item not found.'; return false; }
   if (is_file($absPath)) { if(!@unlink($absPath)){ $error='Cannot delete file.'; return false; } return true; }
   if (is_dir($absPath)) {
     if (is_in_trash($absPath)) return rrmdir($absPath) ?: (($error='Cannot permanently delete folder.') && false);
     $trash = trash_abs();
-    $target=$trash.DIRECTORY_SEPARATOR.basename($absPath).'_'.date('Ymd_His');
+    $target=$trash.DIRECTORY_SEPARATOR.basename($absPath).'_'.date('Ymd_His').'_'.uniqid();
     if(!@rename($absPath,$target)){ $error='Cannot move folder to trash.'; return false; }
     return true;
   }
   $error='Unsupported item.'; return false;
 }
+
 function rename_item(string $absPath, string $newName, ?string &$error = null): bool {
   $error=null; if(!file_exists($absPath)){ $error='Item not found.'; return false; }
   if ($newName==='' || strpos($newName,'/')!==false || strpos($newName,'\\')!==false){ $error='Invalid name.'; return false; }
@@ -308,6 +424,7 @@ function rename_item(string $absPath, string $newName, ?string &$error = null): 
   if(!@rename($absPath,$dest)){ $error='Rename failed.'; return false; }
   return true;
 }
+
 function breadcrumbs(string $rel, array $keepParams = []): string {
   $parts = $rel === '' ? [] : explode('/', str_replace('\\','/',$rel));
   $accum=''; $html=[];
@@ -320,10 +437,6 @@ function breadcrumbs(string $rel, array $keepParams = []): string {
   }
   $html[]='</ol></nav>'; return implode('',$html);
 }
-
-/* ============================
-   COPY SUPPORT
-   ============================ */
 
 function copy_recursive(string $src, string $dst, ?string &$error = null): bool {
   $error = null;
@@ -369,12 +482,7 @@ function copy_recursive(string $src, string $dst, ?string &$error = null): bool 
   return true;
 }
 
-/* ============================
-   PREVIEW / API / AJAX
-   ============================ */
-
-// Image preview
-if (isset($_GET['preview']) && isset($_GET['f'])) {
+if (isset($_GET['preview']) && isset($_GET['f']) && is_authenticated()) {
   $rel = (string)$_GET['f']; $abs = secure_path($rel);
   if ($abs && is_file($abs) && is_image_ext($abs)) {
     $mt = function_exists('mime_content_type') ? @mime_content_type($abs) : null;
@@ -385,13 +493,13 @@ if (isset($_GET['preview']) && isset($_GET['f'])) {
     }
     header('Content-Type: '.$mt);
     header('Content-Length: '.filesize($abs));
+    header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'");
     header('Cache-Control: private, max-age=600');
     readfile($abs); exit;
   }
   http_response_code(404); exit;
 }
 
-// API: Get folder list for Move Dialog
 if (isset($_GET['get_folders']) && is_authenticated()) {
   header('Content-Type: application/json');
   function get_folder_tree($dir) {
@@ -412,7 +520,6 @@ if (isset($_GET['get_folders']) && is_authenticated()) {
   exit;
 }
 
-// Operation: Move (single)
 if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['op'] ?? '') === 'move') {
   header('Content-Type: application/json');
   $srcRel = (string)($_POST['item'] ?? '');
@@ -462,7 +569,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['op']
   exit;
 }
 
-// Operation: COPY (single)
 if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['op'] ?? '') === 'copy') {
   header('Content-Type: application/json');
   $srcRel = (string)($_POST['item'] ?? '');
@@ -480,7 +586,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['op']
   $name = basename($srcAbs);
   $destAbs = $destDirAbs . DIRECTORY_SEPARATOR . $name;
 
-  // Prevent copying into itself (folder -> inside itself)
   if (is_dir($srcAbs)) {
     $srcReal = realpath($srcAbs) ?: $srcAbs;
     $dstReal = realpath($destDirAbs) ?: $destDirAbs;
@@ -516,7 +621,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['op']
   exit;
 }
 
-// Operation: BULK (NEW)
 if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && in_array(($_POST['op'] ?? ''), ['bulk_delete','bulk_move','bulk_copy','bulk_zip'], true)) {
   header('Content-Type: application/json; charset=UTF-8');
 
@@ -577,7 +681,7 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && in_array(($_P
     $zipAbs = $targetDirAbs . DIRECTORY_SEPARATOR . $zipName;
     if (file_exists($zipAbs)) {
       $pi = pathinfo($zipAbs);
-      $zipAbs = $pi['dirname'] . DIRECTORY_SEPARATOR . $pi['filename'] . '_' . time() . '.zip';
+      $zipAbs = $pi['dirname'] . DIRECTORY_SEPARATOR . $pi['filename'] . '_' . uniqid() . '.zip';
     }
 
     $err = null;
@@ -653,7 +757,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && in_array(($_P
   exit;
 }
 
-// READ file for editor (AJAX JSON)
 if (isset($_GET['read']) && isset($_GET['f']) && is_authenticated()) {
   $rel = (string)$_GET['f']; $abs = secure_path($rel);
   header('Content-Type: application/json; charset=UTF-8');
@@ -680,7 +783,6 @@ if (isset($_GET['read']) && isset($_GET['f']) && is_authenticated()) {
   echo json_encode(['ok'=>false,'error'=>'Invalid file']); exit;
 }
 
-// GREP-style search (AJAX JSON): recurse from base, only certain text files, return matches with line numbers
 if (isset($_GET['search']) && is_authenticated()) {
   header('Content-Type: application/json; charset=UTF-8');
   $q = trim((string)($_GET['q'] ?? ''));
@@ -717,6 +819,8 @@ if (isset($_GET['search']) && is_authenticated()) {
         $line = fgets($fh);
         if ($line === false) break;
         $lineNo++;
+        // Skip lines longer than 4096 bytes to avoid mb_strtolower memory exhaustion
+        if (strlen($line) > 4096) continue;        
         $hay = $caseSensitive ? $line : mb_strtolower($line, 'UTF-8');
         $needle = $caseSensitive ? $q : mb_strtolower($q, 'UTF-8');
         if ($needle === '' || mb_strpos($hay, $needle) === false) continue;
@@ -750,7 +854,6 @@ if (isset($_GET['search']) && is_authenticated()) {
   exit;
 }
 
-// File download
 if (isset($_GET['download']) && isset($_GET['f']) && is_authenticated()) {
   $rel = (string)$_GET['f']; $abs = secure_path($rel);
   if ($abs && is_file($abs)) {
@@ -765,10 +868,12 @@ if (isset($_GET['download']) && isset($_GET['f']) && is_authenticated()) {
   http_response_code(404); exit;
 }
 
-// Folder download as temp zip in .trash (Cookie token approach)
-if (isset($_GET['download_zip_folder']) && isset($_GET['f']) && is_authenticated()) {
-  $rel = (string)$_GET['f']; $abs = secure_path($rel);
-  $token = isset($_GET['token']) ? (string)$_GET['token'] : '';
+if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && (string)($_POST['op'] ?? '') === 'download_zip_folder') {
+  $rel = (string)($_POST['item'] ?? '');
+  $abs = secure_path($rel);
+
+  // optional cookie token for the JS overlay/timer
+  $token = (string)($_POST['token'] ?? '');
   if ($token !== '') {
     setcookie('fileDownloadToken', $token, [
       'expires' => time() + 60,
@@ -778,27 +883,39 @@ if (isset($_GET['download_zip_folder']) && isset($_GET['f']) && is_authenticated
       'samesite' => 'Lax',
     ]);
   }
-  if ($abs && is_dir($abs)) {
-    $trash = trash_abs();
-    $zipName = basename($abs) . '_' . date('Ymd_His') . '.zip';
-    $zipAbs = $trash . DIRECTORY_SEPARATOR . $zipName;
-    $err=null;
-    if (create_zip_from($abs, $zipAbs, $err)) {
-      header('Content-Type: application/zip');
-      header('Content-Length: '.filesize($zipAbs));
-      header('Content-Disposition: attachment; filename="'.rawurlencode($zipName).'"');
-      header('Cache-Control: private, max-age=0, must-revalidate');
-      readfile($zipAbs); exit;
-    } else {
-      echo "Error creating zip: ".htmlspecialchars($err ?? 'unknown'); exit;
-    }
+
+  if (!$abs || !is_dir($abs)) { http_response_code(404); exit; }
+
+  $trash = trash_abs();
+  $zipName = basename($abs) . '_' . date('Ymd_His') . '_' . uniqid() . '.zip';
+ $zipAbs = $trash . DIRECTORY_SEPARATOR . $zipName;
+
+  $err = null;
+  if (!create_zip_from($abs, $zipAbs, $err)) {
+    http_response_code(500);
+    header('Content-Type: text/plain; charset=UTF-8');
+    echo "Error creating zip: " . ($err ?? 'unknown');
+    exit;
   }
-  http_response_code(404); exit;
+
+  // ensure cleanup even if client aborts
+  ignore_user_abort(true);
+  register_shutdown_function(function() use ($zipAbs) {
+    if (is_file($zipAbs)) @unlink($zipAbs);
+  });
+
+  $sz = @filesize($zipAbs);
+  header('Content-Type: application/zip');
+  if ($sz !== false) header('Content-Length: ' . $sz);
+  header('Content-Disposition: attachment; filename="' . rawurlencode($zipName) . '"');
+  header('Cache-Control: private, max-age=0, must-revalidate');
+  readfile($zipAbs);
+  @unlink($zipAbs);
+  exit;
 }
 
-// Auth + actions
 if (isset($_GET['action']) && $_GET['action'] === 'logout') { logout_auth(); header('Location: ' . basename(__FILE__)); exit; }
-if (!is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
+if (!is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST') {
   if (try_authenticate()) {
     $redir = [ ];
     if (isset($_GET['p'])) $redir['p'] = (string)$_GET['p'];
@@ -806,23 +923,18 @@ if (!is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST
     header('Location: ' . basename(__FILE__) . (empty($redir) ? '' : href($redir)));
     exit;
   }
-  flash_set('Password incorrect.');
+  flash_set('Password incorrect or account locked out temporarily.');
   header('Location: ' . basename(__FILE__));
   exit;
 }
 
-// Determine folder
 $rel = isset($_GET['p']) ? (string)$_GET['p'] : '';
 $abs = secure_path($rel); if ($abs===false || !is_dir($abs)) { $rel=''; $abs=BASE_ROOT; }
-
-// Toggle show image previews
 $showimg = (isset($_GET['showimg']) && (string)$_GET['showimg'] === '1');
 
-// Operations (rename/zip/unzip/delete/emptytrash/newfile/newfolder/upload/imgbatch/savefile)
 if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['op'])) {
   $op = (string)$_POST['op'];
 
-  // ---- Empty trash
   if ($op === 'emptytrash') {
     $trash = trash_abs(); if (is_dir($trash)) { rrmdir($trash); }
     $msg = 'Trash emptied.';
@@ -831,7 +943,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
   }
 
-  // ---- Upload (AJAX friendly, no overwrite allowed)
   if ($op === 'upload') {
     $isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH']) || ($_POST['ajax'] ?? '')==='1';
     $baseRel = (string)$_POST['base'];
@@ -861,7 +972,7 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     }
     $orig = $_FILES['upload_file']['name'] ?? 'file';
     $name = preg_replace('/[^\w\.\-\s]/u','_', basename($orig));
-    $name = ltrim($name,'.'); // disallow dot-files by trimming leading dots
+    $name = ltrim($name,'.');
     if ($name==='') {
       if ($isAjax) { header('Content-Type: application/json'); echo json_encode(['ok'=>false,'error'=>'Invalid filename']); exit; }
       flash_set('Invalid filename'); header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
@@ -884,7 +995,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
   }
 
-  // ---- Image batch (no "item" needed)
   if ($op === 'imgbatch') {
     if (!extension_loaded('gd')) {
       flash_set('PHP GD extension not available. Cannot process images.');
@@ -892,8 +1002,8 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     }
     @set_time_limit(120);
 
-    $srcType = strtolower((string)($_POST['src_type'] ?? 'all')); // all|jpg|png|webp
-    $dstType = strtolower((string)($_POST['dst_type'] ?? 'keep')); // keep|jpg|png|webp
+    $srcType = strtolower((string)($_POST['src_type'] ?? 'all'));
+    $dstType = strtolower((string)($_POST['dst_type'] ?? 'keep'));
     $doResize = isset($_POST['do_resize']);
     $keepAR   = isset($_POST['keep_ar']);
     $newW     = max(0, (int)($_POST['new_w'] ?? 0));
@@ -920,7 +1030,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
 
       $extOut = ($dstType === 'keep') ? $extIn : $dstType;
 
-      // Determine target size
       $tw = $w0; $th = $h0;
       if ($doResize) {
         $tw = $newW > 0 ? $newW : $w0;
@@ -975,7 +1084,7 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
         $outPath = ($changingType) ? ($dir.DIRECTORY_SEPARATOR.$base.'.'.$extOut) : $src;
       } else {
         $candidate = $dir.DIRECTORY_SEPARATOR.$base.'_conv'.'.'.$extOut;
-        if (file_exists($candidate)) $candidate = $dir.DIRECTORY_SEPARATOR.$base.'_conv_'.time().'.'.$extOut;
+        if (file_exists($candidate)) $candidate = $dir.DIRECTORY_SEPARATOR.$base.'_conv_'.uniqid().'.'.$extOut;
         $outPath = $candidate;
       }
 
@@ -1005,7 +1114,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
   }
 
-  // ---- Save edited text file
   if ($op === 'savefile') {
     $itemRel = (string)($_POST['item'] ?? '');
     $content = (string)($_POST['content'] ?? '');
@@ -1028,7 +1136,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
   }
 
-  // ---- Create file/folder
   if ($op === 'newfile' || $op === 'newfolder') {
     $baseRel = (string)($_POST['base'] ?? '');
     $newName = trim((string)($_POST['newname'] ?? ''));
@@ -1051,7 +1158,6 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
     header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
   }
 
-  // ---- Remaining ops require an "item"
   if (!isset($_POST['item'])) {
     flash_set('No item specified.');
     header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
@@ -1072,7 +1178,7 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
       if ($zipName === null) { flash_set('Invalid zip file name.'); }
       else {
         $destAbs = dirname($itemAbs).DIRECTORY_SEPARATOR.$zipName;
-        if (file_exists($destAbs)) { $pi=pathinfo($destAbs); $destAbs=$pi['dirname'].DIRECTORY_SEPARATOR.$pi['filename'].'_'.time().'.zip'; }
+        if (file_exists($destAbs)) { $pi=pathinfo($destAbs); $destAbs=$pi['dirname'].DIRECTORY_SEPARATOR.$pi['filename'].'_'.uniqid().'.zip'; }
         $err=null; $ok=create_zip_from($itemAbs,$destAbs,$err);
         flash_set($ok ? ('Created zip: '.basename($destAbs)) : ('Zip error: '.($err??'unknown')));
       }
@@ -1092,17 +1198,14 @@ if (is_authenticated() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[
   header('Location: ' . basename(__FILE__) . ($rel!==''?href(['p'=>$rel] + ($showimg?['showimg'=>'1']:[])):( $showimg ? href(['showimg'=>'1']) : '' ))); exit;
 }
 
-// Sorting
 $sort = $_GET['sort'] ?? 'name'; if(!in_array($sort,['name','size','date'])) $sort='name';
 $dir  = $_GET['dir']  ?? ($sort==='size' ? 'desc' : 'asc'); if(!in_array($dir, ['asc','desc'])) $dir='asc';
 
-// Data + totals (for usage bar) + stats (NEW)
 $entries = list_directory($abs);
 sort_entries($entries,$sort,$dir);
 
 $total_bytes = 0;
 $has_images = false;
-
 $stats_total_files = 0;
 $stats_total_dirs = 0;
 $stats_img_files = 0;
@@ -1137,13 +1240,14 @@ foreach ($entries as $en) {
   }
 }
 
-$topImg = top_key_with_count($img_ext_counts);      // [ext, count]
-$topCodeLang = top_key_with_count($code_lang_counts); // [lang, count]
+$topImg = top_key_with_count($img_ext_counts);
+$topCodeLang = top_key_with_count($code_lang_counts);
 
 $keepParams = [];
 if ($rel !== '') $keepParams['p'] = $rel;
 if ($showimg) $keepParams['showimg'] = '1';
 
+$csrf_token = $_SESSION['csrf_token'] ?? '';
 ?>
 <!doctype html>
 <html lang="en">
@@ -1195,10 +1299,10 @@ if ($showimg) $keepParams['showimg'] = '1';
     <img id="imgOverlayImg" src="" alt="preview" loading="lazy">
   </div>
 
-  <!-- Upload Modal -->
   <div class="modal fade" id="uploadModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog">
       <form class="modal-content" id="uploadForm" enctype="multipart/form-data" method="post">
+        <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
         <input type="hidden" name="op" value="upload">
         <input type="hidden" name="base" value="<?=htmlspecialchars(to_rel($abs))?>">
         <input type="hidden" name="ajax" value="1">
@@ -1226,10 +1330,10 @@ if ($showimg) $keepParams['showimg'] = '1';
     </div>
   </div>
 
-  <!-- Editor Modal -->
   <div class="modal fade" id="editModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-xl modal-dialog-scrollable">
       <form class="modal-content" id="editForm" method="post">
+        <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
         <input type="hidden" name="op" value="savefile">
         <input type="hidden" name="item" id="editItem" value="">
         <textarea name="content" id="editContent" style="display:none;"></textarea>
@@ -1265,6 +1369,7 @@ if ($showimg) $keepParams['showimg'] = '1';
         <div class="d-flex gap-2">
           <a class="btn btn-sm btn-outline-secondary" data-folder-link href="<?=href($showimg?['showimg'=>'1']:[])?>">Root</a>
           <form method="post" class="d-inline" id="emptyTrashForm">
+            <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
             <input type="hidden" name="op" value="emptytrash">
             <button class="btn btn-sm btn-outline-danger" type="submit"><span class="material-icons" aria-hidden="true">delete</span> Empty Trash</button>
           </form>
@@ -1310,7 +1415,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         <div class="card-body">
           <?=breadcrumbs($relNow, $showimg?['showimg'=>'1']:[])?>
 
-          <!-- Grep search row -->
           <form class="row g-2 align-items-center mb-3" id="grepForm">
             <div class="col-12 col-md">
               <input type="text" class="form-control" id="grepInput" placeholder="Search recursively from current folder (txt/php/html/css/js)…" autocomplete="off">
@@ -1344,6 +1448,7 @@ if ($showimg) $keepParams['showimg'] = '1';
               <button class="btn btn-sm btn-success" type="button" id="btnUpload"><span class="material-icons" aria-hidden="true">upload</span> Upload</button>
 
               <form method="post" class="d-inline" data-opform="newfile">
+                <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
                 <input type="hidden" name="op" value="newfile">
                 <input type="hidden" name="base" value="<?=htmlspecialchars($relNow)?>">
                 <input type="hidden" name="newname" value="">
@@ -1352,6 +1457,7 @@ if ($showimg) $keepParams['showimg'] = '1';
                 </button>
               </form>
               <form method="post" class="d-inline" data-opform="newfolder">
+                <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
                 <input type="hidden" name="op" value="newfolder">
                 <input type="hidden" name="base" value="<?=htmlspecialchars($relNow)?>">
                 <input type="hidden" name="newname" value="">
@@ -1370,7 +1476,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         </div>
       </div>
 
-      <!-- STATS + OPTIONS (NEW) -->
       <div class="card shadow-sm mb-3">
         <div class="card-body py-3">
           <div class="d-flex flex-wrap gap-3 justify-content-between align-items-start">
@@ -1528,6 +1633,7 @@ if ($showimg) $keepParams['showimg'] = '1';
 
                           <div class="icon-slot">
                             <form method="post" class="d-inline" data-opform="rename">
+                              <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
                               <input type="hidden" name="op" value="rename">
                               <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                               <input type="hidden" name="newname" value="">
@@ -1537,6 +1643,7 @@ if ($showimg) $keepParams['showimg'] = '1';
 
                           <div class="icon-slot">
                             <form method="post" class="d-inline" data-opform="zip">
+                              <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
                               <input type="hidden" name="op" value="zip">
                               <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                               <input type="hidden" name="zipname" value="">
@@ -1547,6 +1654,7 @@ if ($showimg) $keepParams['showimg'] = '1';
                           <div class="icon-slot">
                             <?php if ($isZip): ?>
                               <form method="post" class="d-inline" data-opform="unzip">
+                                <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
                                 <input type="hidden" name="op" value="unzip">
                                 <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                                 <button type="submit" class="icon-btn" title="Unzip">
@@ -1576,6 +1684,7 @@ if ($showimg) $keepParams['showimg'] = '1';
 
                           <div class="icon-slot">
                             <form method="post" class="d-inline" data-opform="delete" data-isdir="<?=$isDir?'1':'0'?>" data-name="<?=htmlspecialchars($name)?>" data-intrash="<?=is_in_trash($e['path'])?'1':'0'?>">
+                              <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
                               <input type="hidden" name="op" value="delete">
                               <input type="hidden" name="item" value="<?=htmlspecialchars($nextRel)?>">
                               <button type="submit" class="icon-btn" title="Delete">
@@ -1630,11 +1739,11 @@ if ($showimg) $keepParams['showimg'] = '1';
       </div>
 
       <?php if ($has_images): ?>
-      <!-- Image batch form -->
       <div class="card shadow-sm mt-3">
         <div class="card-header">Image tools</div>
         <div class="card-body">
           <form method="post" class="row gy-3 align-items-end" data-opform="imgbatch" id="imgBatchForm">
+            <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
             <input type="hidden" name="op" value="imgbatch">
             <div class="col-12 col-md-3">
               <label class="form-label">Source file type</label>
@@ -1713,6 +1822,7 @@ if ($showimg) $keepParams['showimg'] = '1';
   <script src="https://cdn.jsdelivr.net/npm/ace-builds@1.32.9/src-min-noconflict/ace.js"></script>
   <script>
     (function(){
+      const csrfToken = '<?=htmlspecialchars($csrf_token)?>';
       const overlay = document.getElementById('pageOverlay');
       const imgOverlay = document.getElementById('imgOverlay');
       const imgOverlayImg = document.getElementById('imgOverlayImg');
@@ -1730,14 +1840,12 @@ if ($showimg) $keepParams['showimg'] = '1';
       }
       function makeToken(){ return Date.now().toString(36) + Math.random().toString(36).slice(2); }
 
-      // Auto-submit showimg switch
       const showImgForm = document.getElementById('showImgForm');
       const showImgCb = document.getElementById('showimg');
       if (showImgForm && showImgCb) {
         showImgCb.addEventListener('change', ()=> showImgForm.submit());
       }
 
-      // Empty trash confirmation
       const emptyTrashForm = document.getElementById('emptyTrashForm');
       if (emptyTrashForm) {
         emptyTrashForm.addEventListener('submit', function(e){
@@ -1746,12 +1854,27 @@ if ($showimg) $keepParams['showimg'] = '1';
         });
       }
 
-      // Folder navigation and sort headers
       document.querySelectorAll('[data-folder-link]').forEach(a=>{
         a.addEventListener('click', ()=>{ showOverlay(); });
       });
 
-      // Folder download with cookie token detection
+      function postToIframe(fields) {
+        const f = document.createElement('form');
+        f.method = 'post';
+        f.action = window.location.pathname + window.location.search;
+        f.target = 'dlFrame';
+        Object.keys(fields).forEach(k=>{
+          const i = document.createElement('input');
+          i.type = 'hidden';
+          i.name = k;
+          i.value = String(fields[k]);
+          f.appendChild(i);
+        });
+        document.body.appendChild(f);
+        f.submit();
+        f.remove();
+      }
+
       document.querySelectorAll('[data-download-folder]').forEach(a=>{
         a.addEventListener('click', (ev)=>{
           ev.preventDefault();
@@ -1768,20 +1891,21 @@ if ($showimg) $keepParams['showimg'] = '1';
               clearInterval(timer);
               document.cookie = 'fileDownloadToken=; Max-Age=0; Path=/';
               hideOverlay();
-            } else {
-              if (Date.now() - start > 120000) {
-                clearInterval(timer);
-                hideOverlay();
-              }
+            } else if (Date.now() - start > 120000) {
+              clearInterval(timer);
+              hideOverlay();
             }
           }, 400);
 
-          const url = '?download_zip_folder=1&f=' + encodeURIComponent(rel) + '&token=' + encodeURIComponent(token);
-          dlFrame.src = url;
+          postToIframe({
+            op: 'download_zip_folder',
+            item: rel,
+            token: token,
+            csrf_token: csrfToken
+          });
         });
       });
 
-      // Image modal
       document.querySelectorAll('img.thumb').forEach(img=>{
         img.addEventListener('click', ()=>{
           const src = img.getAttribute('data-img') || img.src;
@@ -1794,7 +1918,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         document.addEventListener('keydown', (e)=>{ if (e.key === 'Escape' && imgOverlay.classList.contains('show')) imgOverlay.click(); });
       }
 
-      // Upload button -> open modal
       const btnUpload = document.getElementById('btnUpload');
       const uploadModalEl = document.getElementById('uploadModal');
       const uploadModal = uploadModalEl ? new bootstrap.Modal(uploadModalEl) : null;
@@ -1814,7 +1937,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         });
       }
 
-      // AJAX upload with progress
       const uploadForm = document.getElementById('uploadForm');
       if (uploadForm) {
         uploadForm.addEventListener('submit', function(e){
@@ -1865,7 +1987,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         });
       }
 
-      // -------- Inline editor (Ace) ----------
       let aceEditor = null;
       const aceBase = 'https://cdn.jsdelivr.net/npm/ace-builds@1.32.9/src-min-noconflict/';
       if (window.ace) {
@@ -1985,7 +2106,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         });
       }
 
-      // Ctrl/Cmd+S to save
       document.addEventListener('keydown', function(e){
         const isMac = navigator.platform.toUpperCase().indexOf('MAC')>=0;
         if ((isMac ? e.metaKey : e.ctrlKey) && e.key.toLowerCase() === 's') {
@@ -1996,7 +2116,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         }
       });
 
-      // ---------- GREP UI ----------
       const grepForm = document.getElementById('grepForm');
       const grepInput = document.getElementById('grepInput');
       const grepCS = document.getElementById('grepCS');
@@ -2091,7 +2210,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         });
       }
 
-      // Operation forms: rename/zip/unzip/delete/newfile/newfolder/imgbatch
       document.querySelectorAll('form[data-opform]').forEach(f=>{
         f.addEventListener('submit', (ev)=>{
           const type = f.getAttribute('data-opform');
@@ -2153,7 +2271,6 @@ if ($showimg) $keepParams['showimg'] = '1';
         });
       });
 
-      // Login spinner
       const loginForm = document.getElementById('loginForm');
       if (loginForm) {
         loginForm.addEventListener('submit', ()=>{
@@ -2165,10 +2282,6 @@ if ($showimg) $keepParams['showimg'] = '1';
           showOverlay();
         });
       }
-
-      // --------------------------
-      // MOVE + COPY handlers
-      // --------------------------
 
       async function chooseFolder(titleText) {
         const r = await fetch('?get_folders=1', {headers:{'Accept':'application/json'}});
@@ -2194,6 +2307,7 @@ if ($showimg) $keepParams['showimg'] = '1';
         formData.append('item', item);
         formData.append('dest', dest);
         formData.append('auto_rename', autoRename ? '1' : '0');
+        formData.append('csrf_token', csrfToken);
 
         const response = await fetch('', { method: 'POST', body: formData });
         const res = await response.json();
@@ -2222,6 +2336,7 @@ if ($showimg) $keepParams['showimg'] = '1';
         formData.append('item', item);
         formData.append('dest', dest);
         formData.append('auto_rename', autoRename ? '1' : '0');
+        formData.append('csrf_token', csrfToken);
 
         const response = await fetch('', { method: 'POST', body: formData });
         const res = await response.json();
@@ -2279,10 +2394,6 @@ if ($showimg) $keepParams['showimg'] = '1';
           return;
         }
       });
-
-      // --------------------------
-      // BULK selection + actions
-      // --------------------------
 
       const selAll = document.getElementById('selAll');
       const selCount = document.getElementById('selCount');
@@ -2349,6 +2460,7 @@ if ($showimg) $keepParams['showimg'] = '1';
 
         const formData = new FormData();
         formData.append('op', op);
+        formData.append('csrf_token', csrfToken);
         items.forEach(v => formData.append('items[]', v));
 
         if (extraFields) {
