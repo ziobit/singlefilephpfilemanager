@@ -62,7 +62,7 @@ function logout_auth(): void {
 }
 
 function flash_set(string $msg): void { $_SESSION['zip_manager_flash'] = $msg; }
-function flash_get(): ?string { $m = $_SESSION['zip_manager_flash'] ?? null; unset($_SESSION['zip_manager_flash']); return $m; }
+function flash_get() { $m = $_SESSION['zip_manager_flash'] ?? null; unset($_SESSION['zip_manager_flash']); return $m; }
 
 // Enforce CSRF for ALL POST requests (except login)
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -190,6 +190,108 @@ function is_grep_ext(string $name): bool {
   return in_array($ext, ['txt','php','phtml','html','htm','css','js']);
 }
 
+
+function php_function_enabled(string $fn): bool {
+  if (!function_exists($fn)) return false;
+  $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+  return !in_array($fn, $disabled, true);
+}
+
+function filename_search_recursive(string $baseAbs, string $query, bool &$usedFind = false, bool &$truncated = false, ?string &$error = null): array {
+  $usedFind = false;
+  $truncated = false;
+  $error = null;
+
+  $query = trim($query);
+  if ($query === '') {
+    $error = 'Empty filename search.';
+    return [];
+  }
+
+  $max = 500;
+  $out = [];
+  $trashReal = realpath(trash_abs()) ?: '';
+  $trashReal = str_replace('\\', '/', $trashReal);
+
+  if (DIRECTORY_SEPARATOR === '/' && php_function_enabled('exec')) {
+    $usedFind = true;
+
+    $cmd =
+      'cd ' . escapeshellarg($baseAbs) .
+      ' && find . -path ' . escapeshellarg('./' . TRASH_DIR) . ' -prune -o -iname ' . escapeshellarg('*' . $query . '*') . ' -print 2>/dev/null | head -n ' . (string)($max + 1);
+
+    $lines = [];
+    $status = 0;
+    @exec($cmd, $lines, $status);
+
+    if ($status === 0 || !empty($lines)) {
+      foreach ($lines as $line) {
+        $line = trim((string)$line);
+        if ($line === '' || $line === '.') continue;
+
+        $relFromBase = preg_replace('#^\\./#', '', $line);
+        $abs = rtrim($baseAbs, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relFromBase);
+        $real = realpath($abs) ?: $abs;
+        $realNorm = str_replace('\\', '/', $real);
+
+        if ($trashReal && ($realNorm === $trashReal || strpos($realNorm, $trashReal . '/') === 0)) continue;
+
+        $rel = to_rel($real);
+        if ($rel === '') continue;
+
+        $out[] = [
+          'name' => basename($real),
+          'rel' => $rel,
+          'is_dir' => is_dir($real),
+          'size' => is_file($real) ? (int)(@filesize($real) ?: 0) : 0,
+          'mtime' => (int)(@filemtime($real) ?: 0),
+        ];
+
+        if (count($out) > $max) {
+          $truncated = true;
+          array_pop($out);
+          break;
+        }
+      }
+
+      return $out;
+    }
+  }
+
+  try {
+    $it = new RecursiveIteratorIterator(
+      new RecursiveDirectoryIterator($baseAbs, FilesystemIterator::SKIP_DOTS),
+      RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    foreach ($it as $path => $info) {
+      $real = realpath($path) ?: $path;
+      $realNorm = str_replace('\\', '/', $real);
+
+      if ($trashReal && ($realNorm === $trashReal || strpos($realNorm, $trashReal . '/') === 0)) continue;
+      if (stripos($info->getFilename(), $query) === false) continue;
+
+      $out[] = [
+        'name' => $info->getFilename(),
+        'rel' => to_rel($real),
+        'is_dir' => $info->isDir(),
+        'size' => $info->isFile() ? (int)($info->getSize() ?: 0) : 0,
+        'mtime' => (int)($info->getMTime() ?: 0),
+      ];
+
+      if (count($out) > $max) {
+        $truncated = true;
+        array_pop($out);
+        break;
+      }
+    }
+  } catch (Throwable $e) {
+    $error = $e->getMessage();
+  }
+
+  return $out;
+}
+
 function ext_norm(string $fn): string {
   $e=strtolower(pathinfo($fn, PATHINFO_EXTENSION));
   if ($e==='jpeg') $e='jpg';
@@ -201,7 +303,7 @@ function is_code_lang_ext(string $name): bool {
   return in_array($e, ['php','phtml','inc','phps','js','mjs','jsx','ts','tsx','html','htm','css'], true);
 }
 
-function code_lang_key(string $name): ?string {
+function code_lang_key(string $name) {
   $e = strtolower(pathinfo($name, PATHINFO_EXTENSION));
   if (in_array($e, ['php','phtml','inc','phps'], true)) return 'php';
   if (in_array($e, ['js','mjs','jsx'], true)) return 'js';
@@ -211,21 +313,21 @@ function code_lang_key(string $name): ?string {
   return null;
 }
 
-function top_key(array $counts): ?string {
+function top_key(array $counts) {
   if (empty($counts)) return null;
   arsort($counts);
   foreach ($counts as $k => $v) return (string)$k;
   return null;
 }
 
-function top_key_with_count(array $counts): ?array {
+function top_key_with_count(array $counts) {
   if (empty($counts)) return null;
   arsort($counts);
   foreach ($counts as $k => $v) return [(string)$k, (int)$v];
   return null;
 }
 
-function safe_zip_name(string $zipName): ?string {
+function safe_zip_name(string $zipName) {
   $zipName = trim((string)$zipName);
   if ($zipName === '') return null;
   if (!preg_match('/\.zip$/i', $zipName)) $zipName .= '.zip';
@@ -233,7 +335,7 @@ function safe_zip_name(string $zipName): ?string {
   return $zipName;
 }
 
-function gd_load(string $path, string $ext, ?string &$err) {
+function gd_load(string $path, string $ext, &$err) {
   $err=null; $ext=strtolower($ext);
   if ($ext==='jpg' || $ext==='jpeg') { return @imagecreatefromjpeg($path) ?: ($err='Cannot read JPEG.'); }
   if ($ext==='png') { return @imagecreatefrompng($path) ?: ($err='Cannot read PNG.'); }
@@ -245,7 +347,7 @@ function gd_load(string $path, string $ext, ?string &$err) {
   $err='Unsupported input format: '.$ext; return false;
 }
 
-function gd_save($im, string $path, string $ext, int $quality, ?string &$err): bool {
+function gd_save($im, string $path, string $ext, int $quality,  &$err): bool {
   $err=null; $ext=strtolower($ext); $quality=max(1,min(100,$quality));
   if ($ext==='jpg' || $ext==='jpeg') { return @imagejpeg($im, $path, $quality) ?: ($err='Save JPEG failed.'); }
   if ($ext==='png') {
@@ -261,7 +363,7 @@ function gd_save($im, string $path, string $ext, int $quality, ?string &$err): b
   $err='Unsupported output format: '.$ext; return false;
 }
 
-function create_zip_from(string $srcAbs, string $zipAbs, ?string &$error = null): bool {
+function create_zip_from(string $srcAbs, string $zipAbs,  &$error = null): bool {
   $error=null; $za=new ZipArchive();
   if ($za->open($zipAbs, ZipArchive::CREATE|ZipArchive::OVERWRITE)!==true){ $error='Cannot create zip.'; return false; }
   $srcAbs=rtrim($srcAbs,DIRECTORY_SEPARATOR); $baseName=basename($srcAbs);
@@ -290,7 +392,7 @@ function zip_unique_root(string $base, array &$used): string {
   return $name;
 }
 
-function create_zip_selected(array $absItems, string $zipAbs, ?string &$error=null): bool {
+function create_zip_selected(array $absItems, string $zipAbs,  &$error=null): bool {
   $error = null;
   if (empty($absItems)) { $error='No items selected.'; return false; }
 
@@ -333,7 +435,7 @@ function create_zip_selected(array $absItems, string $zipAbs, ?string &$error=nu
   return true;
 }
 
-function unzip_to_folder_and_delete(string $zipAbsPath, ?string &$error = null): bool {
+function unzip_to_folder_and_delete(string $zipAbsPath,  &$error = null): bool {
   $error = null;
   if (!is_file($zipAbsPath)) { $error = 'Zip not found.'; return false; }
   $dir = dirname($zipAbsPath);
@@ -402,7 +504,7 @@ function rrmdir(string $dir): bool {
   return @rmdir($dir);
 }
 
-function delete_item(string $absPath, ?string &$error = null): bool {
+function delete_item(string $absPath,  &$error = null): bool {
   $error=null; if(!file_exists($absPath)){ $error='Item not found.'; return false; }
   if (is_file($absPath)) { if(!@unlink($absPath)){ $error='Cannot delete file.'; return false; } return true; }
   if (is_dir($absPath)) {
@@ -415,7 +517,7 @@ function delete_item(string $absPath, ?string &$error = null): bool {
   $error='Unsupported item.'; return false;
 }
 
-function rename_item(string $absPath, string $newName, ?string &$error = null): bool {
+function rename_item(string $absPath, string $newName,  &$error = null): bool {
   $error=null; if(!file_exists($absPath)){ $error='Item not found.'; return false; }
   if ($newName==='' || strpos($newName,'/')!==false || strpos($newName,'\\')!==false){ $error='Invalid name.'; return false; }
   $dir=dirname($absPath); $dest=$dir.DIRECTORY_SEPARATOR.$newName;
@@ -438,7 +540,7 @@ function breadcrumbs(string $rel, array $keepParams = []): string {
   $html[]='</ol></nav>'; return implode('',$html);
 }
 
-function copy_recursive(string $src, string $dst, ?string &$error = null): bool {
+function copy_recursive(string $src, string $dst,  &$error = null): bool {
   $error = null;
 
   if (is_link($src)) { $error = 'Refusing to copy symlink.'; return false; }
@@ -781,6 +883,46 @@ if (isset($_GET['read']) && isset($_GET['f']) && is_authenticated()) {
     exit;
   }
   echo json_encode(['ok'=>false,'error'=>'Invalid file']); exit;
+}
+
+
+if (isset($_GET['filename_search']) && is_authenticated()) {
+  header('Content-Type: application/json; charset=UTF-8');
+
+  $q = trim((string)($_GET['q'] ?? ''));
+  $baseRel = (string)($_GET['base'] ?? '');
+  $baseAbs = secure_path($baseRel);
+
+  if ($q === '') {
+    echo json_encode(['ok' => false, 'error' => 'Empty filename search.']);
+    exit;
+  }
+
+  if ($baseAbs === false || !is_dir($baseAbs)) {
+    echo json_encode(['ok' => false, 'error' => 'Invalid base folder.']);
+    exit;
+  }
+
+  $usedFind = false;
+  $truncated = false;
+  $err = null;
+  $results = filename_search_recursive($baseAbs, $q, $usedFind, $truncated, $err);
+
+  if ($err !== null) {
+    echo json_encode(['ok' => false, 'error' => $err]);
+    exit;
+  }
+
+  echo json_encode([
+    'ok' => true,
+    'query' => $q,
+    'base' => to_rel($baseAbs),
+    'usedFind' => $usedFind,
+    'count' => count($results),
+    'truncated' => $truncated,
+    'results' => $results,
+  ]);
+  exit;
 }
 
 if (isset($_GET['search']) && is_authenticated()) {
@@ -1277,6 +1419,7 @@ $csrf_token = $_SESSION['csrf_token'] ?? '';
     .editor-wrap { height: 70vh; border: 1px solid rgba(0,0,0,.125); border-radius: .25rem; }
     #aceEditor { width: 100%; height: 100%; }
     #grepResultsWrap { display:none; }
+    #filenameSearchResultsWrap { display:none; }
     .grep-line { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
     .grep-item .badge { font-weight: 500; }
     .bulkbar .btn { white-space: nowrap; }
@@ -1440,6 +1583,42 @@ $csrf_token = $_SESSION['csrf_token'] ?? '';
             </div>
             <div class="list-group list-group-flush" id="grepList"></div>
             <div class="card-footer small text-muted d-none" id="grepTrunc">Results truncated.</div>
+          </div>
+
+
+          <form class="row g-2 align-items-center mb-3" id="filenameSearchForm">
+            <div class="col-12 col-md">
+              <input type="text" class="form-control" id="filenameSearchInput" placeholder="Search filename recursively from current folder…" autocomplete="off">
+            </div>
+            <div class="col-auto">
+              <button type="submit" class="btn btn-outline-primary">
+                <span class="material-icons" aria-hidden="true">manage_search</span> Find filename
+              </button>
+            </div>
+            <div class="col-auto">
+              <button type="button" class="btn btn-outline-secondary" id="filenameSearchClear">
+                <span class="material-icons" aria-hidden="true">clear</span> Clear
+              </button>
+            </div>
+          </form>
+
+          <div id="filenameSearchResultsWrap" class="card border-0 mb-3">
+            <div class="card-header bg-white d-flex justify-content-between align-items-center">
+              <div>
+                <span class="material-icons" aria-hidden="true">folder_search</span>
+                Filename results
+                <span class="badge bg-light text-dark border ms-2" id="filenameSearchEngine"></span>
+              </div>
+              <div class="small text-muted d-flex align-items-center">
+                <span id="filenameSearchCount">0</span>&nbsp;matches
+                <button type="button" class="btn btn-sm btn-outline-secondary ms-2" id="filenameSearchCopyPaths">
+                  <span class="material-icons" aria-hidden="true">content_copy</span>
+                  Copy paths
+                </button>
+              </div>
+            </div>            
+            <div class="list-group list-group-flush" id="filenameSearchList"></div>
+            <div class="card-footer small text-muted d-none" id="filenameSearchTrunc">Results truncated.</div>
           </div>
 
           <div class="d-flex justify-content-between align-items-center mt-3">
@@ -2124,6 +2303,16 @@ $csrf_token = $_SESSION['csrf_token'] ?? '';
       const grepList = document.getElementById('grepList');
       const grepCount = document.getElementById('grepCount');
       const grepTrunc = document.getElementById('grepTrunc');
+      const filenameSearchForm = document.getElementById('filenameSearchForm');
+      const filenameSearchInput = document.getElementById('filenameSearchInput');
+      const filenameSearchClear = document.getElementById('filenameSearchClear');
+      const filenameSearchWrap = document.getElementById('filenameSearchResultsWrap');
+      const filenameSearchList = document.getElementById('filenameSearchList');
+      const filenameSearchCount = document.getElementById('filenameSearchCount');
+      const filenameSearchTrunc = document.getElementById('filenameSearchTrunc');
+      const filenameSearchEngine = document.getElementById('filenameSearchEngine');
+      const filenameSearchCopyPaths = document.getElementById('filenameSearchCopyPaths');
+      let lastFilenameSearchResults = [];
 
       function esc(s){
         return (s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -2175,6 +2364,180 @@ $csrf_token = $_SESSION['csrf_token'] ?? '';
         });
         grepList.appendChild(frag);
         grepWrap.style.display = 'block';
+      }
+
+
+      function renderFilenameSearch(data, q) {
+        if (!filenameSearchWrap || !filenameSearchList || !filenameSearchCount) return;
+
+        filenameSearchList.innerHTML = '';
+
+        if (!data || !data.ok) {
+          filenameSearchList.innerHTML = `<div class="list-group-item text-danger">${esc((data && data.error) ? data.error : 'Filename search failed.')}</div>`;
+          filenameSearchCount.textContent = '0';
+          filenameSearchWrap.style.display = 'block';
+          return;
+        }
+
+        const res = data.results || [];
+        lastFilenameSearchResults = res;        
+        filenameSearchCount.textContent = data.count || res.length || 0;
+
+        if (filenameSearchTrunc) filenameSearchTrunc.classList.toggle('d-none', !data.truncated);
+        if (filenameSearchEngine) filenameSearchEngine.textContent = data.usedFind ? 'find' : 'PHP';
+
+        if (res.length === 0) {
+          filenameSearchList.innerHTML = `<div class="list-group-item text-muted">No filenames found.</div>`;
+          filenameSearchWrap.style.display = 'block';
+          return;
+        }
+
+        const frag = document.createDocumentFragment();
+
+        res.forEach(r => {
+          const item = document.createElement('div');
+          item.className = 'list-group-item';
+
+          const icon = r.is_dir ? 'folder' : 'description';
+          const openUrl = r.is_dir
+            ? '?' + new URLSearchParams(Object.assign(
+                {p: r.rel},
+                <?=json_encode($showimg ? ['showimg' => '1'] : [])?>
+              )).toString()
+            : '?download=1&f=' + encodeURIComponent(r.rel);
+
+          const sizeText = r.is_dir ? 'folder' : (r.size ? `${Number(r.size).toLocaleString()} bytes` : 'file');
+          const dateText = r.mtime ? new Date(Number(r.mtime) * 1000).toLocaleString() : '-';
+          const canEdit = !r.is_dir && typeof openEditor === 'function';
+
+          item.innerHTML = `
+            <div class="d-flex justify-content-between align-items-center gap-2">
+              <div class="mono">
+                <span class="material-icons me-1" aria-hidden="true">${icon}</span>
+                <span class="text-primary">${highlight(r.name || '', q, false)}</span>
+                <div class="small text-muted mt-1">${esc(r.rel || '')}</div>
+              </div>
+              <div class="text-end">
+                <div class="small text-muted">${esc(sizeText)} · ${esc(dateText)}</div>
+                <div class="btn-group btn-group-sm mt-1">
+                  <a class="btn btn-outline-primary" href="${openUrl}" ${r.is_dir ? 'data-folder-link' : ''}>
+                    <span class="material-icons" aria-hidden="true">${r.is_dir ? 'folder_open' : 'download'}</span>
+                    ${r.is_dir ? 'Open' : 'Download'}
+                  </a>
+                  ${canEdit ? `
+                    <button class="btn btn-outline-secondary" type="button" data-filename-edit-rel="${esc(r.rel)}" data-filename-edit-name="${esc(r.name)}">
+                      <span class="material-icons" aria-hidden="true">edit</span> Edit
+                    </button>
+                  ` : ''}
+                </div>
+              </div>
+            </div>
+          `;
+
+          frag.appendChild(item);
+        });
+
+        filenameSearchList.appendChild(frag);
+        filenameSearchWrap.style.display = 'block';
+      }
+
+      if (filenameSearchForm) {
+        filenameSearchForm.addEventListener('submit', (e) => {
+          e.preventDefault();
+
+          const q = filenameSearchInput && filenameSearchInput.value ? filenameSearchInput.value.trim() : '';
+          if (!q) return;
+
+          const params = new URLSearchParams({
+            filename_search: '1',
+            q,
+            base: '<?=htmlspecialchars(to_rel($abs))?>'
+          });
+
+          showOverlay();
+
+          fetch('?' + params.toString(), {headers: {'Accept': 'application/json'}})
+            .then(r => r.json())
+            .then(data => renderFilenameSearch(data, q))
+            .catch(() => renderFilenameSearch({ok: false, error: 'Filename search failed.'}, q))
+            .finally(() => hideOverlay());
+        });
+      }
+
+      if (filenameSearchClear) {
+        filenameSearchClear.addEventListener('click', () => {
+          if (filenameSearchInput) filenameSearchInput.value = '';
+          if (filenameSearchWrap) filenameSearchWrap.style.display = 'none';
+          if (filenameSearchList) filenameSearchList.innerHTML = '';
+          if (filenameSearchCount) filenameSearchCount.textContent = '0';
+        });
+      }
+
+      if (filenameSearchList) {
+        filenameSearchList.addEventListener('click', (e) => {
+          const btn = e.target.closest('button[data-filename-edit-rel]');
+          if (!btn) return;
+
+          const rel = btn.getAttribute('data-filename-edit-rel');
+          const name = btn.getAttribute('data-filename-edit-name') || (rel ? rel.split('/').pop() : '');
+
+          openEditor(rel, name);
+        });
+      }
+
+      async function copyTextToClipboard(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+
+        let ok = false;
+        try {
+          ok = document.execCommand('copy');
+        } catch (e) {
+          ok = false;
+        }
+
+        document.body.removeChild(ta);
+        return ok;
+      }
+
+      if (filenameSearchCopyPaths) {
+        filenameSearchCopyPaths.addEventListener('click', async () => {
+          const paths = (lastFilenameSearchResults || [])
+            .map(r => r.rel || '')
+            .filter(v => v !== '')
+            .join("\n");
+
+          if (!paths) {
+            alert('No paths to copy.');
+            return;
+          }
+
+          const ok = await copyTextToClipboard(paths);
+
+          if (ok) {
+            const oldHtml = filenameSearchCopyPaths.innerHTML;
+            filenameSearchCopyPaths.innerHTML = '<span class="material-icons" aria-hidden="true">done</span> Copied';
+            filenameSearchCopyPaths.disabled = true;
+
+            setTimeout(() => {
+              filenameSearchCopyPaths.innerHTML = oldHtml;
+              filenameSearchCopyPaths.disabled = false;
+            }, 1200);
+          } else {
+            alert('Copy failed. Your browser may not allow clipboard access on this page.');
+          }
+        });
       }
 
       if (grepForm) {
